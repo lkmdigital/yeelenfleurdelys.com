@@ -1,0 +1,346 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Services\HostProfileCompletion;
+use App\Services\PartnerDocuments;
+use App\Mail\OtpMail;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Validation\Rule;
+
+class HostProfileController extends Controller
+{
+    /**
+     * Étape 1 du changement d'e-mail (retour client 2026-09-02 : le champ
+     * était verrouillé en dur, aucun moyen de le modifier). Envoie un code
+     * OTP à la NOUVELLE adresse — l'e-mail n'est PAS changé ici, seulement
+     * mémorisé dans pending_email en attendant la confirmation ci-dessous.
+     */
+    public function requestEmailChange(Request $request)
+    {
+        if (!$request->user()->isHost() || $request->user()->isStaff()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+
+        $user = $request->user();
+
+        $validated = $request->validate([
+            'email' => ['required', 'email', 'max:255', Rule::unique('users', 'email')->ignore($user->id)],
+        ]);
+
+        $newEmail = $validated['email'];
+        if (strcasecmp($newEmail, $user->email) === 0) {
+            return response()->json(['message' => 'Cette adresse est déjà celle de votre compte.'], 422);
+        }
+
+        $otp = str_pad((string) random_int(0, 999999), 6, '0', STR_PAD_LEFT);
+
+        $user->update([
+            'pending_email'         => $newEmail,
+            'email_otp_code'        => $otp,
+            'email_otp_expires_at'  => now()->addMinutes(15),
+        ]);
+
+        try {
+            Mail::to($newEmail)->send(new OtpMail($user->name, $otp));
+        } catch (\Throwable $e) {
+            Log::error('Email change OTP send failed: ' . $e->getMessage(), ['user_id' => $user->id]);
+            $user->update(['pending_email' => null, 'email_otp_code' => null, 'email_otp_expires_at' => null]);
+            return response()->json(['message' => "Impossible d'envoyer le code à cette adresse. Vérifiez qu'elle est correcte."], 503);
+        }
+
+        return response()->json(['message' => 'Code de vérification envoyé à la nouvelle adresse.']);
+    }
+
+    /**
+     * Étape 2 : le code reçu sur la nouvelle adresse confirme qu'elle est
+     * bien accessible par le responsable — l'e-mail n'est appliqué qu'ici.
+     */
+    public function confirmEmailChange(Request $request)
+    {
+        if (!$request->user()->isHost() || $request->user()->isStaff()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+
+        $user = $request->user();
+
+        $request->validate([
+            'code' => 'required|string|size:6',
+        ]);
+
+        if (!$user->pending_email || !$user->email_otp_code || !$user->email_otp_expires_at) {
+            return response()->json(['message' => "Aucun changement d'e-mail en attente. Recommencez la demande."], 422);
+        }
+
+        if ($user->email_otp_expires_at->isPast()) {
+            return response()->json(['message' => 'Ce code a expiré. Recommencez la demande.'], 422);
+        }
+
+        if (trim($request->code) !== $user->email_otp_code) {
+            return response()->json(['message' => 'Code incorrect.'], 422);
+        }
+
+        $newEmail = $user->pending_email;
+        $user->update([
+            'email'                => $newEmail,
+            'pending_email'        => null,
+            'email_otp_code'       => null,
+            'email_otp_expires_at' => null,
+            'email_verified_at'    => now(),
+        ]);
+
+        Log::info('Adresse e-mail partenaire modifiée', ['user_id' => $user->id]);
+
+        return response()->json(['message' => 'Adresse e-mail mise à jour avec succès.', 'email' => $newEmail]);
+    }
+
+    public function show(Request $request)
+    {
+        if (!$request->user()->isHost()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+        // Le profil complet (coordonnées bancaires + documents de conformité) reste réservé
+        // au propriétaire, même pour un collaborateur "Administrateur" — même règle déjà
+        // appliquée aux retraits (HostWithdrawalController::store()). Aucun des postes
+        // collaborateur n'a de permission "profile" dédiée dans HostStaff::PERMISSIONS ;
+        // ce n'est donc pas un module qu'une case à cocher peut débloquer.
+        if ($request->user()->isStaff()) {
+            return response()->json([
+                'message' => "Le profil de l'établissement (coordonnées bancaires, documents) est réservé au propriétaire du compte.",
+            ], 403);
+        }
+
+        $user = $request->user();
+        
+        // Convertir le chemin de l'avatar en URL complète si nécessaire
+        if ($user->avatar && !str_starts_with($user->avatar, 'http')) {
+            $user->avatar = Storage::url($user->avatar);
+        }
+        
+        // Calculer le pourcentage de complétion
+        $completion = $this->calculateCompletion($user);
+
+        return response()->json([
+            'user' => $user,
+            'completion_percentage' => $completion,
+            'is_complete' => $completion >= 100,
+            'compliance_status' => $user->compliance_status,
+            'compliance_requirements' => $user->compliance_requirements,
+            'documents_required' => PartnerDocuments::required(),
+            'missing_contact_fields' => PartnerDocuments::required() ? [] : HostProfileCompletion::missingContactLabels($user),
+        ]);
+    }
+
+    public function update(Request $request)
+    {
+        if (!$request->user()->isHost()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+        if ($request->user()->isStaff()) {
+            return response()->json([
+                'message' => "Le profil de l'établissement (coordonnées bancaires, documents) est réservé au propriétaire du compte.",
+            ], 403);
+        }
+
+        $user = $request->user();
+
+        $validated = $request->validate([
+            'name' => 'sometimes|string|max:255',
+            'phone' => 'sometimes|string|max:20',
+            'date_of_birth' => 'sometimes|date|before:today',
+            'bio' => 'sometimes|string|max:1000',
+            'address_line1' => 'sometimes|string|max:255',
+            'address_line2' => 'sometimes|nullable|string|max:255',
+            'city' => 'sometimes|string|max:100',
+            'postal_code' => 'sometimes|nullable|string|max:20',
+            'country' => 'sometimes|string|max:100',
+            'phone_fixed' => 'sometimes|nullable|string|max:20',
+            // Retour client 2026-09-15 : chaque hôte doit rester joignable sur
+            // WhatsApp — requis à l'inscription (AuthController), mais jusqu'ici
+            // la mise à jour du profil acceptait de le vider silencieusement.
+            'whatsapp' => 'sometimes|required|string|max:20|regex:/^[\+]?[0-9\s\-\(\)]{6,20}$/',
+            'rccm' => 'sometimes|nullable|string|max:255',
+            'tax_account_number' => 'sometimes|nullable|string|max:255',
+            'bank_name' => 'sometimes|nullable|string|max:255',
+            'bank_account_holder' => 'sometimes|nullable|string|max:255',
+            'bank_account_number' => 'sometimes|nullable|string|max:255',
+            'id_type' => ['sometimes', 'nullable', Rule::in(['CNI', 'Passeport', 'Permis de conduire', 'Autre'])],
+            'id_number' => 'sometimes|nullable|string|max:50',
+            'id_document' => 'sometimes|file|mimes:pdf,jpg,jpeg,png|max:5120', // 5MB - Pour passeport ou document unique
+            'avatar' => 'sometimes|file|mimes:jpg,jpeg,png|max:2048', // 2MB pour l'avatar
+            'id_document_recto' => 'sometimes|file|mimes:pdf,jpg,jpeg,png|max:5120', // Recto pour CNI/Permis
+            'id_document_verso' => 'sometimes|file|mimes:pdf,jpg,jpeg,png|max:5120', // Verso pour CNI/Permis
+            'proof_of_address' => 'sometimes|file|mimes:pdf,jpg,jpeg,png|max:5120',
+            'business_license' => 'sometimes|nullable|file|mimes:pdf,jpg,jpeg,png|max:5120',
+            'rccm_document' => 'sometimes|nullable|file|mimes:pdf,jpg,jpeg,png|max:5120',
+            'tax_document' => 'sometimes|nullable|file|mimes:pdf,jpg,jpeg,png|max:5120',
+        ]);
+
+        // Mise à jour des champs texte
+        // Utiliser input() au lieu de only() pour FormData
+        $updateData = [];
+        $fields = ['name', 'phone', 'date_of_birth', 'bio', 'address_line1', 'address_line2', 'city', 'postal_code', 'country', 'phone_fixed', 'whatsapp', 'rccm', 'tax_account_number', 'id_type', 'id_number', 'bank_name', 'bank_account_holder', 'bank_account_number'];
+        
+        foreach ($fields as $field) {
+            if ($request->has($field)) {
+                $value = $request->input($field);
+                $updateData[$field] = $value === '' ? null : $value;
+            }
+        }
+        
+        if (!empty($updateData)) {
+            $user->fill($updateData);
+        }
+
+        // Gestion de l'avatar
+        if ($request->hasFile('avatar')) {
+            if ($user->avatar) {
+                // Supprimer l'ancien avatar si c'est un chemin relatif
+                $oldPath = str_replace('/storage/', '', $user->avatar);
+                if (!str_starts_with($oldPath, 'http')) {
+                    Storage::disk('public')->delete($oldPath);
+                }
+            }
+            $path = $request->file('avatar')->store('avatars', 'public');
+            // Stocker l'URL complète au lieu du chemin relatif
+            $user->avatar = Storage::url($path);
+        }
+
+        // Gestion des fichiers d'identité
+        // Pour Passeport ou Autre : un seul fichier
+        if ($request->hasFile('id_document')) {
+            if ($user->id_document_path) {
+                Storage::disk('local')->delete($user->id_document_path);
+            }
+            $path = $request->file('id_document')->store('host-documents', 'local');
+            $user->id_document_path = $path;
+            // Nettoyer les fichiers recto/verso si on utilise un document unique
+            if ($user->id_document_recto_path) {
+                Storage::disk('local')->delete($user->id_document_recto_path);
+                $user->id_document_recto_path = null;
+            }
+            if ($user->id_document_verso_path) {
+                Storage::disk('local')->delete($user->id_document_verso_path);
+                $user->id_document_verso_path = null;
+            }
+        }
+
+        // Pour CNI et Permis : recto et verso séparés
+        if ($request->hasFile('id_document_recto')) {
+            if ($user->id_document_recto_path) {
+                Storage::disk('local')->delete($user->id_document_recto_path);
+            }
+            $path = $request->file('id_document_recto')->store('host-documents', 'local');
+            $user->id_document_recto_path = $path;
+            // Nettoyer le document unique si on utilise recto/verso
+            if ($user->id_document_path) {
+                Storage::disk('local')->delete($user->id_document_path);
+                $user->id_document_path = null;
+            }
+        }
+
+        if ($request->hasFile('id_document_verso')) {
+            if ($user->id_document_verso_path) {
+                Storage::disk('local')->delete($user->id_document_verso_path);
+            }
+            $path = $request->file('id_document_verso')->store('host-documents', 'local');
+            $user->id_document_verso_path = $path;
+            // Nettoyer le document unique si on utilise recto/verso
+            if ($user->id_document_path) {
+                Storage::disk('local')->delete($user->id_document_path);
+                $user->id_document_path = null;
+            }
+        }
+
+        if ($request->hasFile('proof_of_address')) {
+            if ($user->proof_of_address_path) {
+                Storage::disk('local')->delete($user->proof_of_address_path);
+            }
+            $path = $request->file('proof_of_address')->store('host-documents', 'local');
+            $user->proof_of_address_path = $path;
+        }
+
+        if ($request->hasFile('business_license')) {
+            if ($user->business_license_path) {
+                Storage::disk('local')->delete($user->business_license_path);
+            }
+            $path = $request->file('business_license')->store('host-documents', 'local');
+            $user->business_license_path = $path;
+        }
+
+        if ($request->hasFile('rccm_document')) {
+            if ($user->rccm_document_path) {
+                Storage::disk('local')->delete($user->rccm_document_path);
+            }
+            $path = $request->file('rccm_document')->store('host-documents', 'local');
+            $user->rccm_document_path = $path;
+        }
+
+        if ($request->hasFile('tax_document')) {
+            if ($user->tax_document_path) {
+                Storage::disk('local')->delete($user->tax_document_path);
+            }
+            $path = $request->file('tax_document')->store('host-documents', 'local');
+            $user->tax_document_path = $path;
+        }
+
+        // Recalculer le statut de complétion
+        $completion = $this->calculateCompletion($user);
+        // Le drapeau stocké garde TOUJOURS le sens historique (documents compris) : si le super administrateur rend un
+        // jour les documents obligatoires, un profil complété sans documents ne passe pas pour complet.
+        $user->profile_completed = HostProfileCompletion::percentage($user, true) >= 100;
+        
+        // Sauvegarder toutes les modifications en une seule fois
+        try {
+            $user->save();
+            
+            // Recharger l'utilisateur pour avoir les dernières données
+            $user->refresh();
+            
+            // Convertir le chemin de l'avatar en URL complète si nécessaire
+            if ($user->avatar && !str_starts_with($user->avatar, 'http')) {
+                $user->avatar = Storage::url($user->avatar);
+            }
+            
+            // Ne jamais logger les valeurs (coordonnées bancaires, numéros fiscaux/identité)
+            // en clair — seuls les noms de champs modifiés ont une valeur de diagnostic ici.
+            \Log::info('Profil mis à jour avec succès', [
+                'user_id' => $user->id,
+                'completion' => $completion,
+                'fields_updated' => array_keys($updateData ?? []),
+            ]);
+            
+            return response()->json([
+                'message' => 'Profil mis à jour avec succès',
+                'user' => $user,
+                'completion_percentage' => $completion,
+                'is_complete' => $completion >= 100,
+                'compliance_status' => $user->compliance_status,
+                'compliance_requirements' => $user->compliance_requirements,
+                'documents_required' => PartnerDocuments::required(),
+                'missing_contact_fields' => PartnerDocuments::required() ? [] : HostProfileCompletion::missingContactLabels($user),
+            'missing_contact_fields' => PartnerDocuments::required() ? [] : HostProfileCompletion::missingContactLabels($user),
+            ], 200);
+        } catch (\Exception $e) {
+            \Log::error('Erreur lors de la sauvegarde du profil', [
+                'user_id' => $user->id,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
+            
+            return response()->json([
+                'message' => 'Erreur lors de la sauvegarde: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /** Pourcentage affiché au partenaire : selon que les documents sont obligatoires ou non (voir PartnerDocuments). */
+    private function calculateCompletion($user): int
+    {
+        return HostProfileCompletion::percentage($user);
+    }
+}
+

@@ -1,0 +1,81 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Couleur unique du site : le bleu Fleur de Lys, avec le jaune en accent. */
+  --brand: 35 49 140;         /* #23318C */
+  --brand-dark: 26 37 105;
+  --brand-light: 101 111 175;
+  --brand-accent: 245 197 24; /* #F5C518 */
+  --brand-on-accent: 23 32 91;
+}
+
+[x-cloak] { display: none !important; }
+
+@layer base {
+  body { @apply bg-white text-gray-900 antialiased dark:bg-gray-950 dark:text-gray-100; }
+  h1, h2, h3, h4 { @apply font-title; }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; scroll-behavior: auto !important; }
+  }
+}
+
+@layer components {
+  .btn { @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-sm font-semibold transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/50 disabled:cursor-not-allowed disabled:opacity-50; }
+  .btn-primary { @apply btn bg-primary text-white hover:bg-primary-dark; }
+  .btn-accent { @apply btn bg-secondary text-onaccent hover:brightness-95; }
+  .btn-secondary { @apply btn border border-gray-300 bg-white text-gray-800 hover:bg-gray-50 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100 dark:hover:bg-gray-800; }
+  .btn-danger { @apply btn bg-red-600 text-white hover:bg-red-700; }
+  .btn-ghost { @apply btn text-gray-700 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-800; }
+  .btn-sm { @apply min-h-10 px-3 py-1.5 text-sm md:min-h-0 md:text-xs; }
+
+  .card { @apply rounded-xl border border-gray-200 bg-white p-5 dark:border-gray-800 dark:bg-gray-900; }
+  .label { @apply mb-1.5 block text-sm font-medium text-gray-700 dark:text-gray-300; }
+  .input { @apply block w-full rounded-lg border border-gray-300 bg-white px-3 py-2.5 text-base md:text-sm text-gray-900 placeholder-gray-400 focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100; }
+  .input-error { @apply border-red-500 focus:border-red-500 focus:ring-red-500/20; }
+  .field-error { @apply mt-1 text-sm text-red-600 dark:text-red-400; }
+  .hint { @apply mt-1 text-xs text-gray-500 dark:text-gray-400; }
+  .badge { @apply inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium; }
+  .link { @apply font-medium text-primary hover:underline; }
+  .table-wrap { @apply relative overflow-x-auto rounded-xl border border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900; }
+  .table { @apply min-w-full divide-y divide-gray-200 text-sm dark:divide-gray-800; }
+  .table th { @apply whitespace-nowrap px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400; }
+  .table td { @apply px-4 py-3 align-top; }
+  .table tbody tr { @apply hover:bg-gray-50 dark:hover:bg-gray-800/50; }
+  .page-title { @apply text-2xl font-bold text-gray-900 dark:text-white; }
+  .section-title { @apply text-lg font-bold text-gray-900 dark:text-white; }
+  .prose-legal h2 { @apply mt-6 mb-2 text-lg font-bold; }
+  .prose-legal p { @apply mb-3 leading-relaxed text-gray-700 dark:text-gray-300; }
+  .prose-legal ul { @apply mb-3 list-disc pl-6; }
+}
+
+/* Accueil : photos du bandeau qui se succèdent en fondu (3 photos, 6 s chacune). */
+.hero-slide { opacity: 0; animation: hero-fade 18s infinite both; animation-delay: calc(var(--i) * 6s); }
+.hero-slide:first-of-type { opacity: 1; }
+@keyframes hero-fade {
+  0% { opacity: 0; transform: scale(1.06); }
+  6% { opacity: 1; }
+  33% { opacity: 1; }
+  40% { opacity: 0; transform: scale(1); }
+  100% { opacity: 0; transform: scale(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .hero-slide { animation: none; }
+  .hero-slide:not(:first-of-type) { display: none; }
+}
+
+/* Tableaux sur mobile (< md) : une carte par ligne, intitulé de colonne à gauche de chaque valeur.
+   Les data-label sont posés par app.js. Le tableau reste un tableau classique à partir de md. */
+@media (max-width: 767.98px) {
+  .table-stacked { min-width: 0; }
+  .table-stacked thead { display: none; }
+  .table-stacked, .table-stacked tbody, .table-stacked tr, .table-stacked td { display: block; width: 100%; }
+  .table-stacked tbody tr { padding: 0.5rem 0; }
+  .table-stacked td { position: relative; padding: 0.375rem 1rem 0.375rem calc(38% + 1rem) !important; text-align: left !important; white-space: normal !important; overflow-wrap: anywhere; min-height: 1.75rem; }
+  .table-stacked td::before { content: attr(data-label); position: absolute; left: 1rem; top: 0.375rem; width: 38%; padding-right: 0.5rem; font-size: 0.75rem; line-height: 1.25rem; color: rgb(107 114 128); }
+  .table-stacked td:first-child, .table-stacked td:not([data-label]), .table-stacked td[data-label=""] { padding-left: 1rem !important; }
+  .table-stacked td:first-child { font-weight: 600; padding-top: 0.5rem !important; }
+  .table-stacked td:first-child::before, .table-stacked td:not([data-label])::before { content: none; }
+  .table-stacked td:empty { display: none; }
+}

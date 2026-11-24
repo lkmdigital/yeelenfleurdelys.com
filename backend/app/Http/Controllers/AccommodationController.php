@@ -1,0 +1,1317 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Accommodation;
+use App\Models\AccommodationImage;
+use App\Models\Room;
+use App\Services\RoomPricingService;
+use App\Services\ImageUploadService;
+use App\Services\HostProfileCompletion;
+use App\Services\PartnerDocuments;
+use App\Support\Security\PublicExposure;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
+
+class AccommodationController extends Controller
+{
+    /**
+     * Un avis public affiche l'auteur (nom, avatar) — jamais ses coordonnées de contact,
+     * qui n'ont rien à faire sur une page d'hébergement consultée par n'importe qui.
+     */
+    private function hideReviewerSensitiveFields($accommodation): void
+    {
+        foreach ($accommodation->reviews as $review) {
+            PublicExposure::reviewer($review->user);
+        }
+    }
+
+    public function index(Request $request)
+    {
+        $query = Accommodation::with(['host', 'images', 'reviews'])->published();
+
+        // Search
+        if ($request->has('search')) {
+            $search = $request->search;
+            $query->where(function($q) use ($search) {
+                $q->where('name', 'like', "%{$search}%")
+                  ->orWhere('description', 'like', "%{$search}%")
+                  ->orWhere('city', 'like', "%{$search}%");
+            });
+        }
+
+        // Filters
+        if ($request->has('city')) {
+            $query->byCity($request->city);
+        }
+
+        if ($request->has('type')) {
+            $query->byType($request->type);
+        }
+
+        if ($request->filled('subtype')) {
+            $query->bySubtype($request->subtype);
+        }
+
+        // Prix (bornes indépendantes)
+        if ($request->filled('min_price')) {
+            $query->where('price_per_night', '>=', (float) $request->min_price);
+        }
+        if ($request->filled('max_price')) {
+            $query->where('price_per_night', '<=', (float) $request->max_price);
+        }
+
+        // Note minimale
+        if ($request->filled('min_rating')) {
+            $query->where('rating', '>=', (float) $request->min_rating);
+        }
+
+        // Services / équipements (tous requis). Comparaison insensible à la casse via
+        // une recherche texte sur le JSON brut plutôt que whereJsonContains (comparaison
+        // stricte) : robuste si un hôte a saisi "wi-fi" au lieu de "Wi-Fi" par exemple.
+        if ($request->filled('amenities')) {
+            foreach (array_filter(array_map('trim', explode(',', $request->amenities))) as $amenity) {
+                $query->whereRaw('LOWER(amenities) LIKE ?', ['%"' . mb_strtolower($amenity) . '"%']);
+            }
+        }
+
+        // Politique d'annulation -> heures (Flexible 48h / Modérée 24h / Stricte 0h)
+        if ($request->filled('cancellation_policy')) {
+            $policy = \Illuminate\Support\Str::lower($request->cancellation_policy);
+            $map = ['flexible' => 48, 'modérée' => 24, 'moderee' => 24, 'stricte' => 0];
+            if (array_key_exists($policy, $map)) {
+                $query->where('cancellation_policy_hours', $map[$policy]);
+            }
+        }
+
+        if ($request->has('featured')) {
+            // Les offres promotionnelles (établissements "featured") sont réservées aux
+            // voyageurs inscrits — c'est un levier d'inscription volontaire, pas une
+            // simple mise en avant marketing. $request->user() se résout depuis le
+            // Bearer token même sur cette route publique (guard par défaut = sanctum),
+            // sans middleware auth:sanctum nécessaire.
+            if (!$request->user()) {
+                return response()->json([
+                    'message' => 'Créez votre compte ou connectez-vous pour découvrir nos offres promotionnelles.',
+                    'requires_auth' => true,
+                ], 401);
+            }
+            $query->featured();
+        }
+
+        // Filtrer par dates et nombre de voyageurs si fournis
+        $checkIn = $request->get('check_in');
+        $checkOut = $request->get('check_out');
+        $guests = $request->get('guests');
+
+        if (($checkIn && $checkOut) || $guests) {
+            $query->availableFor($checkIn && $checkOut ? $checkIn : null, $checkIn && $checkOut ? $checkOut : null, $guests ? (int) $guests : null);
+        }
+
+        // Tri (mapping depuis le paramètre `sort` du front)
+        switch ($request->get('sort')) {
+            case 'price_asc':   $query->orderBy('price_per_night', 'asc'); break;
+            case 'price_desc':  $query->orderBy('price_per_night', 'desc'); break;
+            case 'rating':      $query->orderBy('rating', 'desc'); break;
+            case 'recommended': $query->orderBy('is_featured', 'desc')->orderBy('rating', 'desc'); break;
+            case 'popular':
+                // Retour client 2026-09-17 : "Les établissements à la une" sur
+                // l'accueil doit se baser sur les mieux notés, les plus
+                // visités (réservations confirmées, faute de tracking de vues)
+                // et les plus aimés (favoris) — pas sur la simple date de
+                // création. Tri à plusieurs clés plutôt qu'un score combiné
+                // arbitraire : note d'abord, puis nombre d'avis (départage un
+                // 5/5 avec un seul avis d'un 4.8/5 avec des centaines), puis
+                // favoris, puis réservations confirmées.
+                $query->withCount('favorites')
+                    ->withCount(['bookings as confirmed_bookings_count' => fn ($q) => $q->where('status', 'confirmed')])
+                    ->orderBy('rating', 'desc')
+                    ->orderBy('total_reviews', 'desc')
+                    ->orderBy('favorites_count', 'desc')
+                    ->orderBy('confirmed_bookings_count', 'desc');
+                break;
+            default:
+                $sortBy = $request->get('sort_by', 'created_at');
+                $sortOrder = $request->get('sort_order', 'desc');
+                $query->orderBy($sortBy, $sortOrder);
+        }
+
+        $perPage = $request->get('per_page', 12);
+        $accommodations = $query->paginate($perPage);
+
+        // Endpoint public (aucune authentification requise) : l'hôte n'y est jamais plus qu'un nom et une photo.
+        foreach ($accommodations->getCollection() as $accommodation) {
+            PublicExposure::accommodation($accommodation);
+            // Prix à afficher = prix réellement facturé (retour client 2026-09-08).
+            $accommodation->setAttribute(
+                'effective_price_per_night',
+                RoomPricingService::getDisplayPricePerNight((float) $accommodation->price_per_night, $accommodation)
+            );
+        }
+
+        return response()->json($accommodations);
+    }
+
+    public function show(Request $request, $id)
+    {
+        // Charger les chambres actives avec leurs images pour les visiteurs
+        $query = Accommodation::with([
+            'host', 
+            'images', 
+            'reviews.user',
+            'rooms' => function($query) {
+                $query->active() // Seulement les chambres actives
+                      ->with(['images' => function($q) {
+                          $q->ordered(); // Images triées
+                      }, 'primaryImage']); // Image principale
+            }
+        ]);
+
+        // If authenticated and is owner or admin, allow viewing regardless of status
+        $user = $request->user();
+        if ($user && ($user->isAdmin() || Accommodation::where('id', $id)->where('host_id', $user->hostScopeId())->exists())) {
+            // Pour le propriétaire/admin : charger TOUTES les chambres (actives et inactives)
+            $accommodation = Accommodation::with([
+                'host', 
+                'images', 
+                'reviews.user',
+                'rooms' => function($query) {
+                    $query->with(['images' => function($q) {
+                        $q->ordered();
+                    }, 'primaryImage']);
+                }
+            ])->findOrFail($id);
+        } else {
+            // Public: only published accommodations with active rooms
+            $accommodation = $query->published()->findOrFail($id);
+            // Endpoint public (aucune authentification requise) : l'hôte n'y est jamais plus qu'un nom et
+            // une photo. La branche propriétaire/admin ci-dessus garde un accès complet, légitime (voir
+            // /dashboard/admin/accommodations/{id} et le profil hôte).
+            PublicExposure::accommodation($accommodation);
+        }
+
+        // Un avis affiche son auteur (nom, avatar) — jamais ses coordonnées de contact ni
+        // ses documents, quel que soit qui consulte la fiche (public, hôte ou admin) : cette
+        // page n'a jamais eu vocation à exposer les données d'un voyageur tiers.
+        $this->hideReviewerSensitiveFields($accommodation);
+
+        // Prix à afficher = prix réellement facturé, plans non-remboursable /
+        // modifiable inclus (retour client 2026-09-08 : "30 000" affiché puis
+        // "33 000" au paiement). Injecté sur l'établissement ET chaque chambre.
+        $accommodation->setAttribute(
+            'effective_price_per_night',
+            RoomPricingService::getDisplayPricePerNight((float) $accommodation->price_per_night, $accommodation)
+        );
+        $accommodation->relationLoaded('rooms') && $accommodation->rooms->each(function ($room) use ($accommodation) {
+            $room->setAttribute(
+                'effective_price_per_night',
+                RoomPricingService::getDisplayPricePerNight((float) $room->price_per_night, $accommodation)
+            );
+        });
+
+        return response()->json($accommodation);
+    }
+
+    /**
+     * Nuits déjà prises pour un établissement (publique) — sert à griser ces
+     * dates dans les calendriers de réservation. Mêmes règles de blocage que
+     * BookingService::assertAvailable() / BookingController::store() : une
+     * réservation confirmée (payée),
+     * occupe ses nuits [check_in, check_out) ; une chambre n'est indisponible
+     * qu'une fois toutes ses unités prises ou bloquée par l'hôte. Sans
+     * chambre active, seules les réservations "sans chambre" comptent. Avec
+     * plusieurs chambres et sans room_id, une nuit n'est grisée que si TOUTES
+     * les chambres sont prises. Sous-ensemble de dates uniquement (aucune
+     * donnée voyageur exposée).
+     */
+    public function unavailableDates(Request $request, $id)
+    {
+        $accommodation = Accommodation::where('status', 'published')->findOrFail($id);
+        $today = \Carbon\Carbon::today();
+        $end = $today->copy()->addMonths(18);
+
+        // Seules les réservations confirmées (payées) bloquent une date.
+        $blocking = function ($q) {
+            $q->whereIn('status', \App\Enums\BookingStatus::occupying());
+        };
+
+        $rooms = $accommodation->rooms()->where('is_active', true);
+        if ($request->filled('room_id')) {
+            $rooms->where('id', (int) $request->input('room_id'));
+        }
+        $rooms = $rooms->get();
+
+        $nights = []; // date => true, nuits indisponibles
+
+        $expand = function ($booking, callable $add) use ($today, $end) {
+            $cursor = \Carbon\Carbon::parse($booking->check_in)->startOfDay();
+            $stop = \Carbon\Carbon::parse($booking->check_out)->startOfDay();
+            while ($cursor->lt($stop)) {
+                if ($cursor->gte($today) && $cursor->lte($end)) {
+                    $add($cursor->toDateString(), (int) ($booking->rooms_quantity ?? 1));
+                }
+                $cursor->addDay();
+            }
+        };
+
+        // Réservations "sans chambre" : occupent l'établissement entier.
+        $legacy = \App\Models\Booking::where('accommodation_id', $accommodation->id)
+            ->whereNull('room_id')
+            ->where($blocking)
+            ->where('check_out', '>', $today->toDateString())
+            ->where('check_in', '<', $end->toDateString())
+            ->get(['check_in', 'check_out', 'rooms_quantity']);
+        foreach ($legacy as $b) {
+            $expand($b, function ($d) use (&$nights) { $nights[$d] = true; });
+        }
+
+        if (!$rooms->isEmpty()) {
+            $perRoomUnavailable = [];
+            foreach ($rooms as $room) {
+                $units = max(1, (int) ($room->quantity ?? 1));
+                $used = [];
+                $bookings = \App\Models\Booking::where('room_id', $room->id)
+                    ->where($blocking)
+                    ->where('check_out', '>', $today->toDateString())
+                    ->where('check_in', '<', $end->toDateString())
+                    ->get(['check_in', 'check_out', 'rooms_quantity']);
+                foreach ($bookings as $b) {
+                    $expand($b, function ($d, $q) use (&$used) { $used[$d] = ($used[$d] ?? 0) + $q; });
+                }
+                $roomNights = [];
+                foreach ($used as $d => $q) {
+                    if ($q >= $units) $roomNights[$d] = true;
+                }
+                \App\Models\RoomAvailability::where('room_id', $room->id)
+                    ->where('status', 'blocked')
+                    ->where('date', '>=', $today->toDateString())
+                    ->where('date', '<=', $end->toDateString())
+                    ->pluck('date')
+                    ->each(function ($d) use (&$roomNights) { $roomNights[\Carbon\Carbon::parse($d)->toDateString()] = true; });
+                $perRoomUnavailable[] = $roomNights;
+            }
+            $candidate = array_keys($perRoomUnavailable[0] ?? []);
+            foreach ($candidate as $d) {
+                $all = true;
+                foreach ($perRoomUnavailable as $set) {
+                    if (!isset($set[$d])) { $all = false; break; }
+                }
+                if ($all) $nights[$d] = true;
+            }
+        }
+
+        $dates = array_keys($nights);
+        sort($dates);
+
+        return response()->json(['dates' => $dates]);
+    }
+
+    /**
+     * Aperçu du prix effectif selon les dates et la politique d'annulation.
+     * Utilise la tarification automatique (non remboursable -10%, modifiable +10%, long séjour -15%).
+     */
+    public function pricePreview(Request $request, $id)
+    {
+        $accommodation = Accommodation::published()->findOrFail($id);
+
+        $request->validate([
+            'check_in' => 'required|date|after_or_equal:today',
+            'check_out' => 'required|date|after:check_in',
+            'room_id' => 'nullable|exists:rooms,id',
+            // Retour client 2026-09-02 (Partie 4.3) : réservation multi-chambres
+            // — le devis affiché au voyageur doit refléter le nombre d'unités
+            // choisi, pas seulement le tarif d'une chambre.
+            'rooms_quantity' => 'nullable|integer|min:1|max:20',
+            // Petits-déjeuners supplémentaires choisis dans le récapitulatif : ils entrent dans
+            // le total de la réservation, donc dans le calcul de la garantie (décision Yeelen & Fleur de Lys
+            // 2026-10-08 — le récapitulatif doit annoncer le montant de la page de paiement).
+            'extra_breakfast_quantity' => 'nullable|integer|min:0|max:20',
+            // Code d'invitation d'un ambassadeur saisi dans le récapitulatif (remise de bienvenue de 5 % sur la 1re nuitée).
+            'referral_code' => 'nullable|string|max:20',
+        ], [
+            'check_in.after_or_equal' => "La date d'arrivée doit être aujourd'hui ou dans le futur.",
+            'check_out.after' => "La date de départ doit être postérieure à la date d'arrivée.",
+        ]);
+
+        $roomId = $request->filled('room_id') ? (int) $request->room_id : null;
+        $rooms = (int) ($request->input('rooms_quantity') ?? 1);
+        $breakfast = (int) ($request->input('extra_breakfast_quantity') ?? 0);
+
+        $quote = \App\Services\StayQuoteService::quote($accommodation, $roomId, $request->check_in, $request->check_out, $rooms, $breakfast);
+
+        // Remise de bienvenue du parrainage ambassadeur : affichée et déduite du montant à payer AVANT la réservation.
+        $offer = app(\App\Services\PartnerReferralService::class)
+            ->welcomeDiscount($request->user('sanctum'), $request->input('referral_code'), (float) $quote['effective_price_per_night'], $rooms);
+        $quote['referral_discount'] = null;
+        if ($offer['error']) {
+            $quote['referral_discount'] = ['error' => $offer['error']];
+        } elseif ($offer['amount'] > 0) {
+            $quote = \App\Services\StayQuoteService::quote(
+                $accommodation, $roomId, $request->check_in, $request->check_out, $rooms, $breakfast, $offer['amount']
+            );
+            $quote['referral_discount'] = [
+                'amount' => $offer['amount'],
+                'percent' => $offer['percent'],
+                'label' => 'Invitation de ' . ($offer['partner']->display_name ?: 'notre partenaire'),
+            ];
+        }
+
+        return response()->json($quote);
+    }
+
+    /**
+     * Villes réellement en avant sur l'accueil (retour client 2026-09-02) :
+     * la page d'accueil affichait 4 villes codées en dur (Grand-Bassam, Assinie,
+     * Man, Yamoussoukro) avec des prix et photos Unsplash inventés, sans lien
+     * avec les établissements réels en base — trompeur pour un visiteur qui
+     * clique dessus et ne trouve rien de correspondant. Cette route calcule les
+     * villes les plus représentées parmi les établissements publiés ET ayant
+     * au moins une chambre active (donc réellement réservables), avec le prix
+     * le plus bas et une vraie photo pour chacune.
+     */
+    public function topCities(Request $request)
+    {
+        $limit = min((int) $request->get('limit', 6), 12);
+
+        // Tous les établissements publiés comptent, avec ou sans chambre enregistrée (avant le 2026-11-05, ceux sans
+        // chambre active manquaient au décompte : « Korhogo 11 » pour 12 établissements).
+        $rows = Accommodation::published()
+            ->select('id', 'city', 'name', 'price_per_night', 'rating', 'cancellation_policy_hours',
+                'pricing_non_refundable_enabled', 'pricing_non_refundable_discount',
+                'pricing_modifiable_enabled', 'pricing_modifiable_surcharge')
+            ->with(['images' => fn ($q) => $q->orderByDesc('is_primary')->orderBy('order')])
+            ->get()
+            ->filter(fn ($a) => !empty(trim((string) $a->city)))
+            ->groupBy(fn ($a) => mb_strtolower(trim($a->city)));
+
+        $cities = $rows->map(function ($group) {
+            // Représentant de la ville : le mieux noté parmi ceux qui ont une photo (la photo principale d'abord).
+            $representative = $group->sortByDesc(fn ($a) => $a->rating ?? 0)->first(fn ($a) => $a->images->isNotEmpty()) ?? $group->first();
+            return [
+                'city' => trim($group->first()->city),
+                'accommodations_count' => $group->count(),
+                // Prix d'appel = prix réellement facturé (retour client 2026-09-08).
+                'from_price' => (float) $group
+                    ->map(fn ($a) => RoomPricingService::getDisplayPricePerNight((float) $a->price_per_night, $a))
+                    ->min(),
+                'image' => $representative->images->first()->url ?? null,
+            ];
+        })
+            ->filter(fn ($c) => !empty($c['image'])) // pas de photo = pas présentable en carte destination
+            ->sortByDesc('accommodations_count')
+            ->take($limit)
+            ->values();
+
+        return response()->json(['cities' => $cities]);
+    }
+
+    /**
+     * Suggestions d'autocomplétion pour la barre de recherche
+     * Retourne villes et noms d'hébergements correspondant à la requête
+     */
+    public function suggestions(Request $request)
+    {
+        $q = trim($request->get('q', ''));
+        $limit = min((int) $request->get('limit', 8), 15);
+
+        if (strlen($q) < 2) {
+            return response()->json(['cities' => [], 'accommodations' => []]);
+        }
+
+        $search = '%' . $q . '%';
+
+        // Villes distinctes correspondant à la recherche
+        $cities = Accommodation::published()
+            ->where('city', 'like', $search)
+            ->select('city')
+            ->distinct()
+            ->orderBy('city')
+            ->limit(5)
+            ->pluck('city')
+            ->values()
+            ->toArray();
+
+        // Hébergements correspondant (nom ou ville)
+        $accommodations = Accommodation::published()
+            ->where(function ($query) use ($search) {
+                $query->where('name', 'like', $search)
+                    ->orWhere('city', 'like', $search);
+            })
+            ->select('id', 'name', 'city', 'slug')
+            ->orderBy('name')
+            ->limit($limit - count($cities))
+            ->get()
+            ->map(function ($a) {
+                return [
+                    'id' => $a->id,
+                    'name' => $a->name,
+                    'city' => $a->city,
+                    'slug' => $a->slug,
+                ];
+            });
+
+        return response()->json([
+            'cities' => $cities,
+            'accommodations' => $accommodations,
+        ]);
+    }
+
+    /**
+     * Récupérer les établissements de la même ville (pour suggestions)
+     * Route publique - accessible sans authentification
+     */
+    public function getSimilarByCity(Request $request, $id)
+    {
+        // Récupérer l'établissement (même s'il n'est pas publié, on peut quand même suggérer d'autres établissements)
+        $accommodation = Accommodation::findOrFail($id);
+        
+        // Si l'établissement n'a pas de ville, retourner un tableau vide
+        if (!$accommodation->city) {
+            return response()->json([]);
+        }
+        
+        // Récupérer les établissements de la même ville, publiés uniquement, excluant l'établissement actuel
+        $similar = Accommodation::with(['images'])
+            ->published() // Seulement les établissements publiés
+            ->where('city', $accommodation->city)
+            ->where('id', '!=', $id)
+            ->orderBy('rating', 'desc') // Trier par note décroissante
+            ->orderBy('created_at', 'desc') // Puis par date de création
+            ->limit(6) // Limiter à 6 suggestions
+            ->get();
+
+        $similar->each(fn ($a) => $a->setAttribute(
+            'effective_price_per_night',
+            RoomPricingService::getDisplayPricePerNight((float) $a->price_per_night, $a)
+        ));
+
+        return response()->json($similar);
+    }
+
+    public function uploadMedia(Request $request, $id, ImageUploadService $uploadService)
+    {
+        $mediaLog = \Log::channel('media_upload');
+        
+        $mediaLog->info("=== UPLOAD MEDIA REQUEST START ===", [
+            'accommodation_id' => $id,
+            'user_id' => $request->user()?->id,
+            'has_files' => $request->hasFile('media'),
+        ]);
+
+        try {
+            $accommodation = Accommodation::findOrFail($id);
+        } catch (\Exception $e) {
+            $mediaLog->error("Accommodation not found", ['id' => $id]);
+            return response()->json(['message' => 'Hébergement non trouvé'], 404);
+        }
+
+        if (!$request->user()) {
+            return response()->json(['message' => 'Non authentifié'], 401);
+        }
+
+        if ($accommodation->host_id !== $request->user()->hostScopeId() && !$request->user()->isAdmin()) {
+            return response()->json(['message' => 'Permission refusée'], 403);
+        }
+
+        // Récupérer les fichiers
+        $mediaFiles = $request->file('media', []);
+        if (empty($mediaFiles)) {
+            $mediaFiles = $request->file('media[]', []);
+        }
+        if (!is_array($mediaFiles)) {
+            $mediaFiles = $mediaFiles ? [$mediaFiles] : [];
+        }
+        $mediaFiles = array_values(array_filter($mediaFiles, fn($f) => $f instanceof \Illuminate\Http\UploadedFile));
+        
+        if (empty($mediaFiles)) {
+            return response()->json(['message' => 'Aucun fichier fourni'], 422);
+        }
+
+        // Limiter à 10 fichiers
+        $existingCount = $accommodation->images()->count();
+        if (($existingCount + count($mediaFiles)) > 10) {
+            return response()->json(['message' => 'Maximum 10 fichiers par hébergement'], 422);
+        }
+
+        $saved = [];
+        $errors = [];
+
+        foreach ($mediaFiles as $index => $file) {
+            try {
+                if (!$file || !$file->isValid()) {
+                    $errors[] = "Fichier invalide à l'index {$index}";
+                    continue;
+                }
+
+                $mime = $file->getMimeType();
+                $isImage = str_starts_with($mime, 'image/');
+                $isVideo = str_starts_with($mime, 'video/');
+
+                // Types autorisés
+                if (!$isImage && !$isVideo) {
+                    $errors[] = "Type non autorisé à l'index {$index}";
+                    continue;
+                }
+
+                // Validation taille
+                if ($file->getSize() > 10 * 1024 * 1024) {
+                    $errors[] = "Fichier trop volumineux à l'index {$index} (max 10MB)";
+                    continue;
+                }
+
+                if ($isImage) {
+                    // Upload via le service pour les images (avec compression auto)
+                    $result = $uploadService->upload($file, "accommodations/{$accommodation->id}", 'acc');
+                    $fullUrl = $result['full_url'];
+                } else {
+                    // Upload direct pour les vidéos (pas de compression)
+                    $dir = "accommodations/{$accommodation->id}";
+                    if (!Storage::disk('public')->directoryExists($dir)) {
+                        Storage::disk('public')->makeDirectory($dir);
+                    }
+                    $path = $file->store($dir, 'public');
+                    $fullUrl = asset(Storage::url($path));
+                    
+                    // Fallback public/storage
+                    try {
+                        $publicPath = public_path('storage/' . $path);
+                        File::ensureDirectoryExists(dirname($publicPath));
+                        File::copy(Storage::disk('public')->path($path), $publicPath);
+                    } catch (\Exception $e) {
+                        $mediaLog->warning("Copy to public/storage failed", ['path' => $path]);
+                    }
+                }
+
+                $mediaLog->info("File uploaded", [
+                    'index' => $index,
+                    'mime' => $mime,
+                    'url' => $fullUrl,
+                ]);
+
+                $image = AccommodationImage::create([
+                    'accommodation_id' => $accommodation->id,
+                    'url' => $fullUrl,
+                    'is_primary' => $existingCount === 0 && $index === 0,
+                    'order' => $existingCount + $index + 1,
+                ]);
+
+                $saved[] = $image;
+            } catch (\Exception $e) {
+                $errors[] = "Erreur index {$index}: " . $e->getMessage();
+                $mediaLog->error("Upload failed", ['index' => $index, 'error' => $e->getMessage()]);
+            }
+        }
+
+        if (empty($saved) && !empty($errors)) {
+            return response()->json([
+                'message' => 'Aucun fichier uploadé',
+                'errors' => $errors
+            ], 422);
+        }
+
+        return response()->json([
+            'data' => $saved,
+            'message' => count($saved) . ' fichier(s) uploadé(s)',
+            'errors' => $errors
+        ], 201);
+    }
+
+    /**
+     * Supprimer une image d'un établissement
+     */
+    public function deleteMedia(Request $request, $accommodationId, $imageId, ImageUploadService $uploadService)
+    {
+        $accommodation = Accommodation::findOrFail($accommodationId);
+
+        if ($accommodation->host_id !== $request->user()->hostScopeId() && !$request->user()->isAdmin()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+
+        $image = AccommodationImage::where('accommodation_id', $accommodationId)
+            ->where('id', $imageId)
+            ->firstOrFail();
+
+        // Supprimer via le service
+        $uploadService->delete($image->url, true);
+
+        $wasPrimary = $image->is_primary;
+        $image->delete();
+
+        // Si c'était l'image principale, en définir une nouvelle
+        if ($wasPrimary) {
+            $nextImage = AccommodationImage::where('accommodation_id', $accommodationId)
+                ->orderBy('order')
+                ->orderBy('id')
+                ->first();
+
+            if ($nextImage) {
+                $nextImage->is_primary = true;
+                $nextImage->save();
+            }
+        }
+
+        return response()->json(['message' => 'Image supprimée avec succès']);
+    }
+
+    /**
+     * Définir une image comme image principale
+     */
+    public function setPrimaryMedia(Request $request, $accommodationId, $imageId)
+    {
+        $accommodation = Accommodation::findOrFail($accommodationId);
+
+        // Autorisations : propriétaire ou admin
+        if ($accommodation->host_id !== $request->user()->hostScopeId() && !$request->user()->isAdmin()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+
+        $image = AccommodationImage::where('accommodation_id', $accommodationId)
+            ->where('id', $imageId)
+            ->firstOrFail();
+
+        // Mettre toutes les autres images en non-principales
+        AccommodationImage::where('accommodation_id', $accommodationId)
+            ->update(['is_primary' => false]);
+
+        $image->is_primary = true;
+        $image->save();
+
+        return response()->json([
+            'message' => 'Image principale mise à jour avec succès',
+            'data' => $image,
+        ]);
+    }
+
+    public function store(Request $request)
+    {
+        // Vérifier que le profil hôte est complet et vérifié — pour un compte staff,
+        // c'est la conformité du PROPRIÉTAIRE qui compte, pas celle du collaborateur.
+        $user = $request->user();
+        $complianceUser = $user->isStaff() ? ($user->staffOwner ?? $user) : $user;
+        Log::info('Accommodation store request received', [
+            'user_id' => $user?->id,
+            'profile_completed' => $complianceUser?->profile_completed,
+            'profile_verified' => $complianceUser?->profile_verified,
+            'payload_preview' => $request->only([
+                'name', 'type', 'city', 'price_per_night', 'max_guests'
+            ]),
+        ]);
+
+        if (PartnerDocuments::required()) {
+            if (!$complianceUser->profile_completed) {
+                Log::warning('Accommodation creation blocked: profile not completed', [
+                    'user_id' => $user->id,
+                ]);
+                return response()->json([
+                    'message' => 'Votre profil doit être complété à 100% avant de pouvoir ajouter un hébergement. Veuillez compléter votre profil dans la section "Profil".',
+                    'profile_completion_required' => true
+                ], 403);
+            }
+
+            if (!$complianceUser->profile_verified) {
+                Log::warning('Accommodation creation blocked: profile awaiting verification', [
+                    'user_id' => $user->id,
+                ]);
+                return response()->json([
+                    'message' => 'Votre profil est en attente de vérification par l\'administrateur. Vous pourrez ajouter des hébergements une fois votre profil vérifié.',
+                    'profile_verification_required' => true
+                ], 403);
+            }
+        } elseif (!($complianceUser->profile_completed && $complianceUser->profile_verified) && HostProfileCompletion::percentage($complianceUser, false) < 100) {
+            // Documents facultatifs (réglage « Documents partenaires ») : ni documents, ni validation par un
+            // administrateur ; seules les informations de contact restent demandées. Un partenaire déjà complet et
+            // vérifié à l'ancienne n'est jamais bloqué par le régime assoupli.
+            Log::warning('Accommodation creation blocked: contact details incomplete', [
+                'user_id' => $user->id,
+            ]);
+            $missing = HostProfileCompletion::missingContactLabels($complianceUser);
+
+            return response()->json([
+                'message' => 'Complétez vos informations de contact dans la section "Profil" avant d\'ajouter un hébergement'
+                    . ($missing ? ' : ' . implode(', ', $missing) . ' (champs marqués d\'une étoile)' : '')
+                    . '. Les documents (pièce d\'identité, RCCM, licence…) sont facultatifs pour le moment.',
+                'profile_completion_required' => true,
+                'missing_fields' => $missing,
+            ], 403);
+        }
+
+        $request->validate([
+            'name' => 'required|string|max:255',
+            'whatsapp' => 'nullable|string|max:20|regex:/^[\+]?[0-9\s\-\(\)]+$/',
+            'type' => 'required|string|in:hotel,lodge,guesthouse,apartment,other',
+            'subtype' => ['nullable', 'string', 'max:30', function ($attribute, $value, $fail) use ($request) {
+                $allowed = Accommodation::SUBTYPES[$request->type] ?? [];
+                if ($value && !array_key_exists($value, $allowed)) {
+                    $fail("Cette sous-catégorie n'est pas valide pour ce type d'établissement.");
+                }
+            }],
+            'type_other_label' => 'required_if:type,other|nullable|string|max:191',
+            'description' => 'required|string',
+            'description_en' => 'nullable|string',
+            'address' => 'required|string',
+            'city' => 'required|string',
+            'latitude' => 'required|numeric|between:-90,90',
+            'longitude' => 'required|numeric|between:-180,180',
+            'price_per_night' => 'required|numeric|min:0',
+            'max_guests' => 'required|integer|min:1',
+            'bedrooms' => 'required|integer|min:0',
+            'bathrooms' => 'required|integer|min:0',
+            'amenities' => 'nullable|array',
+            // Nouveaux champs
+            'opening_year' => 'nullable|integer|min:1900|max:' . date('Y'),
+            'star_rating' => 'nullable|integer|min:1|max:5',
+            'standing' => 'nullable|string|in:luxury,standard,economy',
+            'room_types' => 'nullable|array',
+            'room_type_pricing' => 'nullable|array',
+            'room_type_pricing.*.type' => 'required_with:room_type_pricing|string|max:255',
+            'room_type_pricing.*.price_per_night' => 'required_with:room_type_pricing|numeric|min:0',
+            'room_type_pricing.*.rooms_available' => 'nullable|integer|min:0',
+            'room_type_pricing' => 'nullable|array',
+            'room_type_pricing.*.type' => 'required_with:room_type_pricing|string|max:255',
+            'room_type_pricing.*.price_per_night' => 'required_with:room_type_pricing|numeric|min:0',
+            'room_type_pricing.*.rooms_available' => 'nullable|integer|min:0',
+            'conference_rooms_count' => 'nullable|integer|min:0',
+            'conference_capacity' => 'nullable|integer|min:0',
+            'restaurant_capacity' => 'nullable|integer|min:0',
+            'bar_capacity' => 'nullable|integer|min:0',
+            'shuttle_service' => 'nullable|boolean',
+            'laundry' => 'nullable|boolean',
+            'breakfast_price' => 'nullable|numeric|min:0',
+            // Demande utilisateur 2026-09-15 : liste libre des plats/options de
+            // petit-déjeuner proposés, saisie par l'hôte (distinct de la
+            // quantité de petits-déjeuners, Partie 4.11 déjà livrée).
+            'breakfast_menu_items' => 'nullable|array|max:50',
+            'breakfast_menu_items.*' => 'string|max:255',
+            'reception_24h' => 'nullable|boolean',
+            'smoking_area' => 'nullable|boolean',
+            'pets_allowed' => 'nullable|boolean',
+            'other_amenities' => 'nullable|string|max:1000',
+            'deposit_required' => 'nullable|boolean',
+            'deposit_amount' => 'nullable|string|in:first_night,percentage,fixed',
+            // Valeur de la garantie selon son type (décision Yeelen & Fleur de Lys 2026-10-08)
+            'deposit_percentage' => 'nullable|numeric|min:1|max:99|required_if:deposit_amount,percentage',
+            'deposit_fixed_amount' => 'nullable|numeric|min:1|required_if:deposit_amount,fixed',
+            'cancellation_policy_hours' => 'nullable|integer|min:0',
+            'payment_methods' => 'nullable|array',
+            'special_conditions' => 'nullable|string|max:2000',
+            'breakfast_included' => 'nullable|boolean',
+            'breakfast_included_persons' => 'nullable|integer|min:0|max:10',
+            'check_in_time' => 'nullable|date_format:H:i',
+            'check_out_time' => 'nullable|date_format:H:i',
+            'invoice_paid_before_hours' => 'nullable|integer|min:0',
+            // Remises long séjour à 3 paliers, proposées dès l'inscription (retour
+            // client 2026-09-02, Partie 3) : désactivées par défaut, l'hôte choisit.
+            'pricing_long_stay_enabled' => 'nullable|boolean',
+            'pricing_long_stay_tiers' => 'nullable|array',
+            'pricing_long_stay_tiers.*.min_nights' => 'required_with:pricing_long_stay_tiers|integer|min:1|max:365',
+            'pricing_long_stay_tiers.*.max_nights' => 'nullable|integer|min:1|max:365',
+            'pricing_long_stay_tiers.*.discount_percent' => 'required_with:pricing_long_stay_tiers|numeric|min:0|max:100',
+            'pricing_long_stay_tiers.*.enabled' => 'nullable|boolean',
+            // Retour client 2026-09-15 : la participation au programme fidélité
+            // n'était proposable qu'après coup, sur la fiche d'édition — rendue
+            // disponible dès la création (même sémantique que update()).
+            'loyalty_program_joined' => 'nullable|boolean',
+        ]);
+
+        // Sécurité: empêcher la création de doublons pour le même hôte
+        $duplicate = Accommodation::where('host_id', $user->hostScopeId())
+            ->whereRaw('LOWER(name) = LOWER(?)', [$request->name])
+            ->whereRaw('LOWER(city) = LOWER(?)', [$request->city])
+            ->whereNotIn('status', ['removed'])
+            ->first();
+
+        if ($duplicate) {
+            return response()->json([
+                'message' => 'Vous avez déjà enregistré un établissement avec ce nom dans cette ville. Veuillez modifier l\'établissement existant ou choisir un autre nom.',
+                'existing_id' => $duplicate->id,
+            ], 422);
+        }
+
+        Log::info('Accommodation request validated successfully', [
+            'user_id' => $user->id,
+            'amenities_count' => is_array($request->amenities) ? count($request->amenities) : 0,
+            'room_types_count' => is_array($request->room_types) ? count($request->room_types) : 0,
+        ]);
+
+        // Générer un slug unique
+        $baseSlug = \Str::slug($request->name);
+        $slug = $baseSlug;
+        $counter = 1;
+        while (Accommodation::where('slug', $slug)->exists()) {
+            $slug = $baseSlug . '-' . $counter;
+            $counter++;
+        }
+
+        $accommodation = Accommodation::create([
+            'host_id' => $request->user()->hostScopeId(),
+            'name' => $request->name,
+            'whatsapp' => $request->whatsapp,
+            'slug' => $slug,
+            'type' => $request->type,
+            'subtype' => $request->type === 'other' ? null : $request->subtype,
+            'type_other_label' => $request->type === 'other' ? $request->type_other_label : null,
+            'establishment_code' => Accommodation::generateEstablishmentCode($request->city),
+            'description' => $request->description,
+            'description_en' => $request->description_en,
+            'address' => $request->address,
+            'city' => $request->city,
+            'latitude' => $request->latitude,
+            'longitude' => $request->longitude,
+            'price_per_night' => $request->price_per_night,
+            'max_guests' => $request->max_guests,
+            'bedrooms' => $request->bedrooms,
+            'bathrooms' => $request->bathrooms,
+            'amenities' => $request->amenities ?? [],
+            'status' => 'pending',
+            // Nouveaux champs
+            'opening_year' => $request->opening_year,
+            'star_rating' => $request->star_rating,
+            'standing' => $request->standing,
+            'room_types' => $request->room_types ?? [],
+            'room_type_pricing' => $request->room_type_pricing ?? [],
+            'conference_rooms_count' => $request->conference_rooms_count ?? 0,
+            'conference_capacity' => $request->conference_capacity ?? 0,
+            'restaurant_capacity' => $request->restaurant_capacity ?? 0,
+            'bar_capacity' => $request->bar_capacity ?? 0,
+            'shuttle_service' => $request->boolean('shuttle_service', false),
+            'laundry' => $request->boolean('laundry', false),
+            'breakfast_price' => $request->breakfast_price,
+            'breakfast_menu_items' => $request->input('breakfast_menu_items', []),
+            'reception_24h' => $request->boolean('reception_24h', false),
+            'smoking_area' => $request->boolean('smoking_area', false),
+            'pets_allowed' => $request->boolean('pets_allowed', false),
+            'other_amenities' => $request->other_amenities,
+            'deposit_required' => $request->boolean('deposit_required', true),
+            'deposit_amount' => $request->deposit_amount ?? 'first_night',
+            'deposit_percentage' => $request->deposit_amount === 'percentage' ? $request->deposit_percentage : null,
+            'deposit_fixed_amount' => $request->deposit_amount === 'fixed' ? $request->deposit_fixed_amount : null,
+            'cancellation_policy_hours' => $request->cancellation_policy_hours ?? 48,
+            'payment_methods' => $request->payment_methods ?? [],
+            'special_conditions' => $request->special_conditions,
+            'breakfast_included' => $request->boolean('breakfast_included', false),
+            'breakfast_included_persons' => $request->breakfast_included_persons ?? 0,
+            'check_in_time' => $request->check_in_time,
+            'check_out_time' => $request->check_out_time,
+            'invoice_paid_before_hours' => $request->invoice_paid_before_hours ?? 48,
+            'pricing_long_stay_enabled' => $request->boolean('pricing_long_stay_enabled', false),
+            'pricing_long_stay_tiers' => $request->boolean('pricing_long_stay_enabled', false)
+                ? ($request->pricing_long_stay_tiers ?? null)
+                : null,
+            'loyalty_program_joined_at' => $request->boolean('loyalty_program_joined', false) ? now() : null,
+        ]);
+
+        Log::info('Accommodation created successfully', [
+            'accommodation_id' => $accommodation->id,
+            'user_id' => $user->id,
+            'slug' => $accommodation->slug,
+        ]);
+
+        return response()->json($accommodation, 201);
+    }
+
+    public function update(Request $request, $id)
+    {
+        $accommodation = Accommodation::findOrFail($id);
+
+        if ($accommodation->host_id !== $request->user()->hostScopeId() && !$request->user()->isAdmin()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+
+        $request->validate([
+            'name' => 'sometimes|string|max:255',
+            'whatsapp' => 'nullable|string|max:20|regex:/^[\+]?[0-9\s\-\(\)]+$/',
+            'type' => 'sometimes|string|in:hotel,lodge,guesthouse,apartment,other',
+            'subtype' => ['nullable', 'string', 'max:30', function ($attribute, $value, $fail) use ($request, $accommodation) {
+                $type = $request->input('type', $accommodation->type);
+                $allowed = Accommodation::SUBTYPES[$type] ?? [];
+                if ($value && !array_key_exists($value, $allowed)) {
+                    $fail("Cette sous-catégorie n'est pas valide pour ce type d'établissement.");
+                }
+            }],
+            'type_other_label' => 'nullable|string|max:191',
+            'description' => 'sometimes|string',
+            'description_en' => 'nullable|string',
+            'address' => 'sometimes|string',
+            'city' => 'sometimes|string',
+            'latitude' => 'sometimes|numeric|between:-90,90',
+            'longitude' => 'sometimes|numeric|between:-180,180',
+            'price_per_night' => 'sometimes|numeric|min:0',
+            'max_guests' => 'sometimes|integer|min:1',
+            'bedrooms' => 'sometimes|integer|min:0',
+            'bathrooms' => 'sometimes|integer|min:0',
+            'amenities' => 'nullable|array',
+            'status' => 'sometimes|string|in:pending,published,rejected,unavailable,renovation',
+            // Nouveaux champs
+            'opening_year' => 'nullable|integer|min:1900|max:' . date('Y'),
+            'star_rating' => 'nullable|integer|min:1|max:5',
+            'standing' => 'nullable|string|in:luxury,standard,economy',
+            'room_types' => 'nullable|array',
+            'conference_rooms_count' => 'nullable|integer|min:0',
+            'conference_capacity' => 'nullable|integer|min:0',
+            'restaurant_capacity' => 'nullable|integer|min:0',
+            'bar_capacity' => 'nullable|integer|min:0',
+            'shuttle_service' => 'nullable|boolean',
+            'laundry' => 'nullable|boolean',
+            'breakfast_price' => 'nullable|numeric|min:0',
+            // Demande utilisateur 2026-09-15 : liste libre des plats/options de
+            // petit-déjeuner proposés, saisie par l'hôte (distinct de la
+            // quantité de petits-déjeuners, Partie 4.11 déjà livrée).
+            'breakfast_menu_items' => 'nullable|array|max:50',
+            'breakfast_menu_items.*' => 'string|max:255',
+            'reception_24h' => 'nullable|boolean',
+            'smoking_area' => 'nullable|boolean',
+            'pets_allowed' => 'nullable|boolean',
+            'other_amenities' => 'nullable|string|max:1000',
+            'deposit_required' => 'nullable|boolean',
+            'deposit_amount' => 'nullable|string|in:first_night,percentage,fixed',
+            // Valeur de la garantie selon son type (décision Yeelen & Fleur de Lys 2026-10-08)
+            'deposit_percentage' => 'nullable|numeric|min:1|max:99|required_if:deposit_amount,percentage',
+            'deposit_fixed_amount' => 'nullable|numeric|min:1|required_if:deposit_amount,fixed',
+            'cancellation_policy_hours' => 'nullable|integer|min:0',
+            'payment_methods' => 'nullable|array',
+            'special_conditions' => 'nullable|string|max:2000',
+            'breakfast_included' => 'nullable|boolean',
+            'breakfast_included_persons' => 'nullable|integer|min:0|max:10',
+            'check_in_time' => 'nullable|date_format:H:i',
+            'check_out_time' => 'nullable|date_format:H:i',
+            'invoice_paid_before_hours' => 'nullable|integer|min:0',
+            'pricing_auto_enabled' => 'nullable|boolean',
+            'pricing_non_refundable_enabled' => 'nullable|boolean',
+            'pricing_non_refundable_discount' => 'nullable|numeric|min:0|max:100',
+            'pricing_modifiable_enabled' => 'nullable|boolean',
+            'pricing_modifiable_surcharge' => 'nullable|numeric|min:0|max:100',
+            'pricing_long_stay_enabled' => 'nullable|boolean',
+            'pricing_long_stay_discount' => 'nullable|numeric|min:0|max:100',
+            'pricing_long_stay_nights' => 'nullable|integer|min:1|max:90',
+            // Remises long séjour à 3 paliers (retour client 2026-09-02, Partie 3).
+            'pricing_long_stay_tiers' => 'nullable|array',
+            'pricing_long_stay_tiers.*.min_nights' => 'required_with:pricing_long_stay_tiers|integer|min:1|max:365',
+            'pricing_long_stay_tiers.*.max_nights' => 'nullable|integer|min:1|max:365',
+            'pricing_long_stay_tiers.*.discount_percent' => 'required_with:pricing_long_stay_tiers|numeric|min:0|max:100',
+            'pricing_long_stay_tiers.*.enabled' => 'nullable|boolean',
+            'loyalty_program_joined' => 'nullable|boolean',
+        ]);
+
+        // Only admin can set published/rejected
+        if ($request->has('status') && in_array($request->status, ['published', 'rejected'], true) && !$request->user()->isAdmin()) {
+            return response()->json(['message' => 'Only admin can set this status'], 403);
+        }
+
+        $updateData = $request->only([
+            'name', 'whatsapp', 'type', 'subtype', 'type_other_label', 'description', 'description_en', 'address', 'city',
+            'latitude', 'longitude', 'price_per_night', 'max_guests',
+            'bedrooms', 'bathrooms', 'amenities', 'status',
+            // Nouveaux champs
+            'opening_year', 'star_rating', 'standing', 'room_types', 'room_type_pricing',
+            'conference_rooms_count', 'conference_capacity',
+            'restaurant_capacity', 'bar_capacity',
+            'shuttle_service', 'laundry', 'breakfast_price', 'breakfast_menu_items',
+            'reception_24h', 'smoking_area', 'pets_allowed',
+            'other_amenities', 'deposit_required', 'deposit_amount',
+            'deposit_percentage', 'deposit_fixed_amount',
+            'cancellation_policy_hours', 'payment_methods',
+            'special_conditions', 'breakfast_included',
+            'breakfast_included_persons', 'check_in_time',
+            'check_out_time', 'invoice_paid_before_hours',
+            'pricing_auto_enabled', 'pricing_non_refundable_enabled',
+            'pricing_non_refundable_discount', 'pricing_modifiable_enabled',
+            'pricing_modifiable_surcharge', 'pricing_long_stay_enabled',
+            'pricing_long_stay_discount', 'pricing_long_stay_nights',
+            'pricing_long_stay_tiers',
+        ]);
+
+        // Cohérence type / sous-catégorie / libellé libre
+        $effectiveType = $request->input('type', $accommodation->type);
+        if ($effectiveType === 'other') {
+            $updateData['subtype'] = null;
+        } elseif ($request->has('type') || $request->has('subtype')) {
+            $updateData['type_other_label'] = null;
+        }
+
+        // Convertir les valeurs boolean si elles sont présentes
+        if ($request->has('shuttle_service')) {
+            $updateData['shuttle_service'] = $request->boolean('shuttle_service');
+        }
+        if ($request->has('laundry')) {
+            $updateData['laundry'] = $request->boolean('laundry');
+        }
+        if ($request->has('reception_24h')) {
+            $updateData['reception_24h'] = $request->boolean('reception_24h');
+        }
+        if ($request->has('smoking_area')) {
+            $updateData['smoking_area'] = $request->boolean('smoking_area');
+        }
+        if ($request->has('pets_allowed')) {
+            $updateData['pets_allowed'] = $request->boolean('pets_allowed');
+        }
+        if ($request->has('deposit_required')) {
+            $updateData['deposit_required'] = $request->boolean('deposit_required');
+        }
+        // Un seul type de garantie à la fois : la valeur de l'autre type est effacée, pour
+        // qu'un ancien pourcentage ne ressorte pas si l'établissement repasse en montant fixe.
+        if ($request->has('deposit_amount')) {
+            $type = $request->input('deposit_amount') ?: 'first_night';
+            $updateData['deposit_amount'] = $type;
+            $updateData['deposit_percentage'] = $type === 'percentage' ? $request->input('deposit_percentage') : null;
+            $updateData['deposit_fixed_amount'] = $type === 'fixed' ? $request->input('deposit_fixed_amount') : null;
+        }
+        if ($request->has('breakfast_included')) {
+            $updateData['breakfast_included'] = $request->boolean('breakfast_included');
+        }
+        if ($request->has('pricing_auto_enabled')) {
+            $updateData['pricing_auto_enabled'] = $request->boolean('pricing_auto_enabled');
+        }
+        if ($request->has('pricing_non_refundable_enabled')) {
+            $updateData['pricing_non_refundable_enabled'] = $request->boolean('pricing_non_refundable_enabled');
+        }
+        if ($request->has('pricing_modifiable_enabled')) {
+            $updateData['pricing_modifiable_enabled'] = $request->boolean('pricing_modifiable_enabled');
+        }
+        if ($request->has('pricing_long_stay_enabled')) {
+            $updateData['pricing_long_stay_enabled'] = $request->boolean('pricing_long_stay_enabled');
+            if (!$updateData['pricing_long_stay_enabled']) {
+                $updateData['pricing_long_stay_tiers'] = null;
+            }
+        }
+
+        // Participation au programme de fidélité : décision de l'hôte, pas un
+        // simple passthrough (le client n'envoie qu'un booléen, jamais la date
+        // elle-même) — on horodate à l'adhésion, on efface au retrait.
+        if ($request->has('loyalty_program_joined')) {
+            $updateData['loyalty_program_joined_at'] = $request->boolean('loyalty_program_joined')
+                ? ($accommodation->loyalty_program_joined_at ?? now())
+                : null;
+        }
+
+        // Retour client 2026-09-13/14 : une vraie modification de contenu vaut
+        // confirmation implicite que les informations sont à jour — pas un
+        // simple changement de `status` seul (unavailable/renovation), qui ne
+        // dit rien sur l'exactitude du reste de la fiche.
+        if (array_diff(array_keys($updateData), ['status']) !== []) {
+            $updateData['info_confirmed_at'] = now();
+        }
+
+        $accommodation->update($updateData);
+
+        if ($request->has('name')) {
+            // Générer un slug unique si le nom a changé
+            $baseSlug = \Str::slug($request->name);
+            $slug = $baseSlug;
+            $counter = 1;
+            
+            // Vérifier si le slug existe déjà (sauf pour l'accommodation actuelle)
+            while (Accommodation::where('slug', $slug)->where('id', '!=', $accommodation->id)->exists()) {
+                $slug = $baseSlug . '-' . $counter;
+                $counter++;
+            }
+            
+            $accommodation->slug = $slug;
+            $accommodation->save();
+        }
+
+        return response()->json($accommodation);
+    }
+
+    /**
+     * Checklist de publication (brief Extranet Partenaire, Étape 21) : ce qu'il manque
+     * avant que l'hôte puisse soumettre l'établissement à la revue admin.
+     */
+    public function readiness(Request $request, $id)
+    {
+        $accommodation = Accommodation::with('images')->findOrFail($id);
+
+        if ($accommodation->host_id !== $request->user()->hostScopeId() && !$request->user()->isAdmin()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+
+        $checks = [
+            'photos' => [
+                'label' => 'Au moins 5 photos',
+                'ok' => $accommodation->images->count() >= 5,
+            ],
+            'price' => [
+                'label' => 'Prix par nuit défini',
+                'ok' => (float) $accommodation->price_per_night > 0,
+            ],
+            'cancellation_policy' => [
+                'label' => "Politique d'annulation choisie",
+                'ok' => $accommodation->cancellation_policy_hours !== null,
+            ],
+            'whatsapp' => [
+                'label' => "Numéro WhatsApp de l'établissement renseigné",
+                'ok' => !empty($accommodation->whatsapp),
+            ],
+            'bank_details' => [
+                'label' => 'Coordonnées bancaires renseignées (pour les reversements)',
+                'ok' => $accommodation->host?->hasBankDetails() ?? false,
+            ],
+            // Recommandé, pas bloquant : sans chambre enregistrée, le voyageur ne peut pas choisir de chambre
+            // (l'établissement reste réservable tel quel). `blocking: false` = n'empêche pas de publier.
+            'rooms' => [
+                'label' => 'Au moins une chambre enregistrée (recommandé)',
+                'ok' => $accommodation->rooms()->where('is_active', true)->exists(),
+                'blocking' => false,
+            ],
+        ];
+
+        $ready = collect($checks)->filter(fn ($c) => $c['blocking'] ?? true)->every(fn ($c) => $c['ok']);
+
+        return response()->json([
+            'ready' => $ready,
+            'checks' => $checks,
+            'submitted_for_review_at' => $accommodation->submitted_for_review_at,
+            'status' => $accommodation->status,
+        ]);
+    }
+
+    /**
+     * Action hôte "Publier mon établissement" : revalide la checklist côté serveur
+     * puis marque l'établissement comme prêt pour la revue admin (le statut reste
+     * "pending" — seul un admin peut le faire passer "published", cf. update()).
+     */
+    public function submitForReview(Request $request, $id)
+    {
+        $accommodation = Accommodation::with('images')->findOrFail($id);
+
+        if ($accommodation->host_id !== $request->user()->hostScopeId() && !$request->user()->isAdmin()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+
+        $missing = [];
+        if ($accommodation->images->count() < 5) {
+            $missing[] = 'Au moins 5 photos sont requises.';
+        }
+        if ((float) $accommodation->price_per_night <= 0) {
+            $missing[] = 'Le prix par nuit doit être défini.';
+        }
+        if ($accommodation->cancellation_policy_hours === null) {
+            $missing[] = "La politique d'annulation doit être choisie.";
+        }
+        if (empty($accommodation->whatsapp)) {
+            $missing[] = "Le numéro WhatsApp de l'établissement est requis.";
+        }
+        if (!($accommodation->host?->hasBankDetails() ?? false)) {
+            $missing[] = 'Les coordonnées bancaires (RIB) doivent être renseignées dans votre profil.';
+        }
+
+        if (!empty($missing)) {
+            return response()->json([
+                'message' => 'Établissement non prêt pour publication.',
+                'missing' => $missing,
+            ], 422);
+        }
+
+        $accommodation->submitted_for_review_at = now();
+        $accommodation->save();
+
+        return response()->json([
+            'message' => 'Établissement soumis à la revue de notre équipe.',
+            'submitted_for_review_at' => $accommodation->submitted_for_review_at,
+            // Conseil, pas obstacle : ajouter ses chambres permet au voyageur de choisir la sienne.
+            'warnings' => $accommodation->rooms()->where('is_active', true)->exists()
+                ? []
+                : ["Aucune chambre n'est enregistrée : pensez à les ajouter depuis l'onglet « Chambres » pour que les voyageurs puissent choisir."],
+        ]);
+    }
+
+    /**
+     * Retour client 2026-09-13/14 : l'hôte confirme explicitement que les
+     * informations de son établissement sont toujours exactes, sans avoir à
+     * modifier quoi que ce soit — repousse l'échéance du rappel automatique
+     * (RemindAccommodationInfoUpdate) de INFO_UPDATE_REMINDER_MONTHS.
+     */
+    public function confirmInfo(Request $request, $id)
+    {
+        $accommodation = Accommodation::findOrFail($id);
+
+        if ($accommodation->host_id !== $request->user()->hostScopeId() && !$request->user()->isAdmin()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+
+        $accommodation->update(['info_confirmed_at' => now()]);
+
+        return response()->json([
+            'message' => 'Merci, vos informations sont bien marquées comme à jour.',
+            'info_confirmed_at' => $accommodation->info_confirmed_at,
+        ]);
+    }
+
+    public function destroy(Request $request, $id)
+    {
+        $accommodation = Accommodation::findOrFail($id);
+
+        if ($accommodation->host_id !== $request->user()->hostScopeId() && !$request->user()->isAdmin()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+
+        // Seuls les établissements non actifs peuvent être supprimés
+        if ($accommodation->status === 'published') {
+            return response()->json([
+                'message' => 'Impossible de supprimer un établissement publié. Passez-le en "Indisponible" ou "En attente" avant de le supprimer.',
+            ], 422);
+        }
+
+        $hasFutureBookings = $accommodation->bookings()
+            ->whereIn('status', ['confirmed', 'pending'])
+            ->where('check_out', '>=', now()->startOfDay()->toDateString())
+            ->exists();
+
+        if ($hasFutureBookings) {
+            return response()->json([
+                'message' => 'Impossible de supprimer : des réservations à venir existent pour cet établissement.',
+            ], 422);
+        }
+
+        $accommodation->delete();
+
+        return response()->json(['message' => 'Accommodation deleted successfully']);
+    }
+
+    public function myAccommodations(Request $request)
+    {
+        if (!$request->user()->isHost()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+
+        $query = Accommodation::where('host_id', $request->user()->hostScopeId())
+            ->with(['images', 'bookings' => function($q) {
+                $q->where('status', 'confirmed');
+            }])
+            ->withCount(['bookings' => function($q) {
+                $q->where('status', 'confirmed');
+            }])
+            ->withCount([
+                'rooms as total_rooms_count',
+                'rooms as active_rooms_count' => function($q) {
+                    $q->where('is_active', true);
+                },
+                'rooms as inactive_rooms_count' => function($q) {
+                    $q->where('is_active', false);
+                }
+            ]);
+
+        // Filter by status
+        if ($request->has('status')) {
+            $query->where('status', $request->status);
+        }
+
+        // Sort
+        $sortBy = $request->get('sort_by', 'created_at');
+        $sortOrder = $request->get('sort_order', 'desc');
+        $query->orderBy($sortBy, $sortOrder);
+
+        $accommodations = $query->get();
+
+        // Retour client 2026-09-13/14 : signale côté hôte les établissements
+        // dont les informations n'ont pas été reconfirmées depuis longtemps
+        // (bandeau de rappel dans l'Extranet).
+        $accommodations->each(fn (Accommodation $a) => $a->setAttribute('needs_info_update', $a->needsInfoUpdate()));
+
+        return response()->json($accommodations);
+    }
+}
+

@@ -1,0 +1,57 @@
+<?php
+
+namespace App\Console;
+
+use App\Console\Commands\CancelExpiredBookings;
+use App\Console\Commands\RemindAndCancelUnpaidBookings;
+use App\Console\Commands\SendPostStayReviewLinks;
+use Illuminate\Console\Scheduling\Schedule;
+use Illuminate\Foundation\Console\Kernel as ConsoleKernel;
+
+class Kernel extends ConsoleKernel
+{
+    /**
+     * Register the commands for the application.
+     */
+    protected $commands = [
+        CancelExpiredBookings::class,
+        RemindAndCancelUnpaidBookings::class,
+    ];
+
+    /**
+     * Define the application's command schedule.
+     */
+    protected function schedule(Schedule $schedule): void
+    {
+        $schedule->command('bookings:cancel-expired')->everyFifteenMinutes();
+        $schedule->command('bookings:remind-cancel-unpaid')->hourly();
+        $schedule->command('reviews:send-post-stay-links')->dailyAt('09:00');
+        $schedule->command('loyalty:award-points')->dailyAt('09:30');
+        $schedule->command('loyalty:award-birthday-bonus')->dailyAt('08:30');
+        $schedule->command('loyalty:notify-expiring-vouchers')->dailyAt('09:45');
+        $schedule->command('bookings:detect-no-show')->dailyAt('11:00');
+        $schedule->command('users:remind-guest-activation')->hourly();
+        $schedule->command('hosts:remind-onboarding')->hourly();
+        $schedule->command('compliance:remind-hosts')->dailyAt('08:00');
+        // Décalé de 15 min pour ne pas concurrencer compliance:remind-hosts —
+        // même créneau, deux jeux de destinataires différents (dossier hôte
+        // vs. fiche établissement, retour client 2026-09-13/14).
+        $schedule->command('accommodations:remind-info-update')->dailyAt('08:15');
+        // 2 janvier à 02h : laisse une journée de marge après le 31/12 pour
+        // que les check-out de la Saint-Sylvestre soient bien enregistrés
+        // avant de figer le CA de l'année écoulée (doc §12).
+        $schedule->command('corporate:compute-annual-rewards')->yearlyOn(1, 2, '02:00');
+        $schedule->command('sanctum:prune-expired --hours=24')->daily();
+    }
+
+    /**
+     * Register the commands for the application.
+     */
+    protected function commands(): void
+    {
+        $this->load(__DIR__.'/Commands');
+
+        require base_path('routes/console.php');
+    }
+}
+

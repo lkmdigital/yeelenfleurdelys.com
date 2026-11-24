@@ -1,0 +1,436 @@
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+
+class Accommodation extends Model
+{
+    /** Vrai dès qu'on a constaté la colonne is_synthetic (jamais mémorisé tant qu'elle manque : fenêtre de déploiement). */
+    private static bool $syntheticColumnKnown = false;
+
+    /**
+     * Les établissements « synthétiques » (test de la supervision) sont invisibles partout, sauf pour les requêtes
+     * du moniteur (en-tête secret, voir MarkMonitorRequests) et quand on retire explicitement la portée.
+     */
+    protected static function booted(): void
+    {
+        static::addGlobalScope('hide_synthetic', function (\Illuminate\Database\Eloquent\Builder $query) {
+            if (app()->bound('ops.monitor')) {
+                return;
+            }
+            if (!self::$syntheticColumnKnown) {
+                if (!\Illuminate\Support\Facades\Schema::hasColumn('accommodations', 'is_synthetic')) {
+                    return; // migration pas encore passée (déploiement en cours)
+                }
+                self::$syntheticColumnKnown = true;
+            }
+            $query->where($query->getModel()->getTable() . '.is_synthetic', false);
+        });
+    }
+
+    use HasFactory;
+
+    /** Code pays utilisé pour l'identifiant unique d'établissement (plateforme Côte d'Ivoire uniquement). */
+    public const COUNTRY_CODE = '+225';
+
+    /**
+     * Sous-catégories par famille (`type`), cf. rapport de vérification point 5.
+     * `type` sans `subtype` correspond à la catégorie "standard" de la famille.
+     */
+    public const SUBTYPES = [
+        'hotel' => [
+            'apart_hotel' => 'Appart-Hôtel',
+            'motel' => 'Motel',
+            'auberge' => 'Auberge',
+        ],
+        'apartment' => [
+            'furnished' => 'Résidence Meublée',
+            'luxury' => 'Résidence luxueuse',
+        ],
+    ];
+
+    protected $fillable = [
+        'host_id',
+        'name',
+        'whatsapp',
+        'slug',
+        'type',
+        'subtype',
+        'type_other_label',
+        'establishment_code',
+        'description',
+        'description_en',
+        'address',
+        'city',
+        'latitude',
+        'longitude',
+        'price_per_night',
+        'max_guests',
+        'bedrooms',
+        'bathrooms',
+        'amenities',
+        'status',
+        'submitted_for_review_at',
+        'is_featured',
+        'rating',
+        'total_reviews',
+        // Nouveaux champs
+        'opening_year',
+        'star_rating',
+        'standing',
+        'room_types',
+        'room_type_pricing',
+        'conference_rooms_count',
+        'conference_capacity',
+        'restaurant_capacity',
+        'bar_capacity',
+        'shuttle_service',
+        'laundry',
+        'breakfast_price',
+        'breakfast_menu_items',
+        'reception_24h',
+        'smoking_area',
+        'pets_allowed',
+        'other_amenities',
+        'deposit_required',
+        'deposit_amount',
+        // Valeur de la garantie selon son type (décision Yeelen & Fleur de Lys 2026-10-08)
+        'deposit_percentage',
+        'deposit_fixed_amount',
+        'cancellation_policy_hours',
+        'payment_methods',
+        'special_conditions',
+        'breakfast_included',
+        'breakfast_included_persons',
+        'check_in_time',
+        'check_out_time',
+        'invoice_paid_before_hours',
+        // Tarification : chaque plan est une option à cocher par l'hôte
+        'pricing_auto_enabled',
+        'pricing_non_refundable_enabled',
+        'pricing_non_refundable_discount',
+        'pricing_modifiable_enabled',
+        'pricing_modifiable_surcharge',
+        'pricing_long_stay_enabled',
+        'pricing_long_stay_discount',
+        'pricing_long_stay_nights',
+        'pricing_long_stay_tiers',
+        // Synchronisation externe (brief Extranet Partenaire, Étape 18)
+        'ical_import_url',
+        'ical_last_synced_at',
+        'ical_last_sync_status',
+        'ical_last_sync_error',
+        'ical_last_sync_events_count',
+        'channel_manager_interest_requested_at',
+        'loyalty_program_joined_at',
+        // Rappel de mise à jour des informations (retour client 2026-09-13/14).
+        'info_confirmed_at',
+        'info_update_reminder_sent_at',
+    ];
+
+    /**
+     * Garantie de réservation telle que paramétrée par l'établissement, prête à afficher
+     * (fiche publique, récapitulatif, paiement, confirmation) : une seule source, pour que
+     * le libellé annoncé corresponde toujours au montant calculé.
+     */
+    protected $appends = ['guarantee'];
+
+    public function getGuaranteeAttribute(): ?array
+    {
+        // Requête partielle (ex. accommodation:id,name) : le paramétrage n'est pas chargé,
+        // on ne renvoie rien plutôt qu'une valeur par défaut trompeuse.
+        if (!array_key_exists('deposit_required', $this->attributes)) {
+            return null;
+        }
+
+        return \App\Services\PaymentOptionsService::describeGuarantee($this);
+    }
+
+    protected function casts(): array
+    {
+        return [
+            'submitted_for_review_at' => 'datetime',
+            'loyalty_program_joined_at' => 'datetime',
+            'info_confirmed_at' => 'datetime',
+            'info_update_reminder_sent_at' => 'datetime',
+            'amenities' => 'array',
+            'breakfast_menu_items' => 'array',
+            'room_types' => 'array',
+            'room_type_pricing' => 'array',
+            'payment_methods' => 'array',
+            'latitude' => 'decimal:8',
+            'longitude' => 'decimal:8',
+            'price_per_night' => 'decimal:2',
+            'breakfast_price' => 'decimal:2',
+            'is_featured' => 'boolean',
+            'rating' => 'decimal:2',
+            'shuttle_service' => 'boolean',
+            'laundry' => 'boolean',
+            'reception_24h' => 'boolean',
+            'smoking_area' => 'boolean',
+            'pets_allowed' => 'boolean',
+            'deposit_required' => 'boolean',
+            'deposit_percentage' => 'decimal:2',
+            'deposit_fixed_amount' => 'decimal:2',
+            'breakfast_included' => 'boolean',
+            'pricing_auto_enabled' => 'boolean',
+            'pricing_non_refundable_enabled' => 'boolean',
+            'pricing_modifiable_enabled' => 'boolean',
+            'pricing_long_stay_enabled' => 'boolean',
+            'pricing_non_refundable_discount' => 'decimal:2',
+            'pricing_modifiable_surcharge' => 'decimal:2',
+            'pricing_long_stay_discount' => 'decimal:2',
+            'pricing_long_stay_tiers' => 'array',
+            'ical_last_synced_at' => 'datetime',
+            'channel_manager_interest_requested_at' => 'datetime',
+        ];
+    }
+
+    public function host()
+    {
+        return $this->belongsTo(User::class, 'host_id');
+    }
+
+    public function bookings()
+    {
+        return $this->hasMany(Booking::class);
+    }
+
+    public function reviews()
+    {
+        return $this->hasMany(Review::class);
+    }
+
+    public function favorites()
+    {
+        return $this->hasMany(Favorite::class);
+    }
+
+    public function images()
+    {
+        return $this->hasMany(AccommodationImage::class);
+    }
+
+    public function rooms()
+    {
+        return $this->hasMany(Room::class);
+    }
+
+    public function subscriptions()
+    {
+        return $this->hasMany(Subscription::class);
+    }
+
+    public function activeSubscription()
+    {
+        return $this->hasOne(Subscription::class)->where('status', 'active')
+            ->where('expires_at', '>=', now());
+    }
+
+    public function promotions()
+    {
+        return $this->hasMany(Promotion::class);
+    }
+
+    public function activePromotions()
+    {
+        return $this->hasMany(Promotion::class)->where('is_active', true);
+    }
+
+    public function scopePublished($query)
+    {
+        return $query->where('status', 'published');
+    }
+
+    /**
+     * Nombre de mois au-delà duquel un établissement doit reconfirmer ses
+     * informations (retour client 2026-09-13/14). La réunion du 8 sept a
+     * évoqué 3 mois (étapes suivantes) puis 6 mois (décision actée) — retenu
+     * 6 mois, la formulation "décision" ; à ajuster si le client précise 3.
+     */
+    public const INFO_UPDATE_REMINDER_MONTHS = 6;
+
+    /**
+     * true si les informations de l'établissement n'ont pas été confirmées
+     * depuis plus de INFO_UPDATE_REMINDER_MONTHS — jamais confirmées
+     * (info_confirmed_at NULL) retombe sur la date de création.
+     */
+    public function needsInfoUpdate(): bool
+    {
+        $anchor = $this->info_confirmed_at ?? $this->created_at;
+        if (!$anchor) {
+            return false;
+        }
+
+        return $anchor->lt(now()->subMonths(self::INFO_UPDATE_REMINDER_MONTHS));
+    }
+
+    public function scopeFeatured($query)
+    {
+        return $query->where('is_featured', true);
+    }
+
+    public function scopeByCity($query, $city)
+    {
+        return $query->where('city', $city);
+    }
+
+    /**
+     * La ville s'écrit toujours de la même façon (« San Pedro », jamais « SAN PEDRO » ni « San pedro ») : les villes
+     * populaires, les filtres et les recherches regroupent ainsi les établissements d'une même ville.
+     */
+    public function setCityAttribute($value): void
+    {
+        $this->attributes['city'] = \App\Support\CityName::normalize($value);
+    }
+
+    /**
+     * Établissements pouvant accueillir la demande (dates et/ou nombre de voyageurs).
+     *
+     * - Avec chambres : au moins une chambre ACTIVE de capacité suffisante, libre sur toute la période.
+     * - Sans aucune chambre active : l'établissement se réserve tel quel (réservation « sans chambre »), il est donc jugé
+     *   sur sa propre capacité d'accueil et sur ses réservations confirmées, au lieu d'être écarté de toutes les
+     *   recherches (constat du 2026-11-05 : Villa Massouk et La Belle Rive, publiées sans chambre, étaient introuvables
+     *   sur le site, qui envoie toujours un nombre de voyageurs).
+     */
+    public function scopeAvailableFor($query, ?string $checkIn, ?string $checkOut, ?int $guests)
+    {
+        $hasDates = $checkIn && $checkOut;
+
+        return $query->where(function ($outer) use ($checkIn, $checkOut, $guests, $hasDates) {
+            $outer->whereHas('rooms', function ($q) use ($checkIn, $checkOut, $guests, $hasDates) {
+                $q->where('is_active', true);
+
+                if ($guests) {
+                    $q->where('capacity', '>=', $guests);
+                }
+
+                if ($hasDates) {
+                    // Exclure les chambres avec des conflits de disponibilité manuelle
+                    $q->whereDoesntHave('availabilities', function ($aq) use ($checkIn, $checkOut) {
+                        $aq->whereBetween('date', [$checkIn, $checkOut])
+                            ->where('status', '!=', 'available');
+                    });
+
+                    // Vérifier qu'il reste au moins une chambre disponible : on compare la quantité avec le
+                    // nombre de réservations confirmées pour ces dates.
+                    $q->whereRaw('COALESCE(quantity, 1) > COALESCE((
+                        SELECT COUNT(*)
+                        FROM bookings
+                        WHERE bookings.room_id = rooms.id
+                        AND bookings.status = "confirmed"
+                        AND (
+                            (bookings.check_in <= ? AND bookings.check_out >= ?)
+                            OR (bookings.check_in BETWEEN ? AND ?)
+                            OR (bookings.check_out BETWEEN ? AND ?)
+                        )
+                    ), 0)', [$checkOut, $checkIn, $checkIn, $checkOut, $checkIn, $checkOut]);
+                }
+            })->orWhere(function ($noRooms) use ($checkIn, $checkOut, $guests, $hasDates) {
+                $noRooms->whereDoesntHave('rooms', fn ($r) => $r->where('is_active', true));
+
+                if ($guests) {
+                    // Capacité non renseignée = inconnue : on ne l'écarte pas.
+                    $noRooms->where(fn ($w) => $w->whereNull('max_guests')->orWhere('max_guests', '>=', $guests));
+                }
+
+                if ($hasDates) {
+                    $noRooms->whereDoesntHave('bookings', fn ($b) => $b->whereNull('room_id')
+                        ->where('status', 'confirmed')
+                        ->where('check_in', '<', $checkOut)
+                        ->where('check_out', '>', $checkIn));
+                }
+            });
+        });
+    }
+
+    public function scopeByType($query, $type)
+    {
+        return $query->where('type', $type);
+    }
+
+    public function scopeBySubtype($query, $subtype)
+    {
+        return $query->where('subtype', $subtype);
+    }
+
+    /**
+     * Génère l'identifiant unique d'établissement.
+     *
+     * Retour client 2026-09-02 (Partie 4.2) : "format recommandé à valider :
+     * YF-VILLE-XXX, par exemple YF-KGO-00O1." Confirmé avec l'utilisateur :
+     * adopter ce format pour les NOUVEAUX établissements. Comme pour
+     * generateBookingNumber() (même retour client, même logique), les codes
+     * déjà attribués (ancien format Code pays-Séquence-Année, ex.
+     * +225-00001-26) restent inchangés — un identifiant d'établissement doit
+     * être stable, le renuméroter casserait toute référence externe déjà
+     * distribuée (exports, API partenaires, communication avec l'hôte).
+     *
+     * Séquence par ville plutôt que globale : le doc donne un exemple à 4
+     * chiffres par ville (YF-KGO-0001), pas un compteur unique toutes villes
+     * confondues.
+     */
+    public static function generateEstablishmentCode(string $city): string
+    {
+        $cityCode = self::cityCodeFor($city);
+        $prefix = "YF-{$cityCode}-";
+
+        do {
+            $maxSeq = (int) \Illuminate\Support\Facades\DB::table('accommodations')
+                ->where('establishment_code', 'like', $prefix . '%')
+                ->selectRaw('MAX(CAST(SUBSTRING(establishment_code, ?) AS UNSIGNED)) as max_seq', [strlen($prefix) + 1])
+                ->value('max_seq');
+
+            $sequence = str_pad((string) ($maxSeq + 1), 4, '0', STR_PAD_LEFT);
+            $code = $prefix . $sequence;
+        } while (self::where('establishment_code', $code)->exists());
+
+        return $code;
+    }
+
+    /**
+     * Code ville à 3 lettres pour generateEstablishmentCode() — dérivé du nom
+     * de ville (pas de table de correspondance officielle type IATA) :
+     * translittéré, majuscules, 3 premières lettres. "XXX" si la ville est
+     * vide ou ne contient aucune lettre.
+     */
+    private static function cityCodeFor(string $city): string
+    {
+        $ascii = iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $city) ?: '';
+        $letters = strtoupper(preg_replace('/[^a-zA-Z]/', '', $ascii));
+
+        return $letters !== '' ? str_pad(substr($letters, 0, 3), 3, 'X') : 'XXX';
+    }
+
+    public function scopePriceRange($query, $min, $max)
+    {
+        return $query->whereBetween('price_per_night', [$min, $max]);
+    }
+
+    /**
+     * Historique des modifications (audit logs)
+     */
+    public function auditLogs()
+    {
+        return $this->hasMany(AccommodationAuditLog::class);
+    }
+
+    /**
+     * Notes internes admin
+     */
+    public function adminNotes()
+    {
+        return $this->morphMany(AdminNote::class, 'noteable');
+    }
+
+    /**
+     * Inspections effectuées sur cet établissement
+     */
+    public function inspections()
+    {
+        return $this->hasMany(Inspection::class);
+    }
+}
+

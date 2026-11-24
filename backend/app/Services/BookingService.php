@@ -1,0 +1,625 @@
+<?php
+
+namespace App\Services;
+
+use App\Enums\BookingStatus;
+use App\Exceptions\InvalidBookingTransitionException;
+use App\Exceptions\RoomNotAvailableException;
+use App\Models\Booking;
+use App\Models\BookingHistory;
+use App\Models\ClientCredit;
+use App\Models\Room;
+use App\Models\RoomAvailability;
+use Carbon\Carbon;
+use App\Mail\BookingApprovedPleasePay;
+use App\Mail\BookingConfirmation;
+use App\Mail\HostNewBooking;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Mail;
+
+class BookingService
+{
+    /**
+     * Vérification de disponibilité ATOMIQUE — à appeler dans une transaction
+     * avec lockForUpdate() actif sur la ligne room.
+     *
+     * Couvre tous les cas de chevauchement :
+     *   |--- existing ---|
+     *         |--- requested ---|   ✓ conflit
+     *   |-------- existing --------|
+     *       |-- requested --|       ✓ conflit
+     *   |-- existing --|
+     *                    |-- req --|  pas de conflit
+     */
+    public function assertAvailable(int $roomId, Carbon $checkIn, Carbon $checkOut, ?int $excludeBookingId = null, int $requestedQuantity = 1): void
+    {
+        // Verrouille la ligne room dans la même transaction que l'appelant
+        // (redondant si déjà verrouillée par lui, sans effet de bord — mêmes
+        // garanties MySQL) pour lire quantity de façon cohérente.
+        $room = Room::lockForUpdate()->find($roomId);
+        $quantity = max(1, (int) ($room->quantity ?? 1));
+
+        $query = Booking::where('room_id', $roomId)
+            // Retour client 2026-09-18 : seules les réservations CONFIRMÉES (donc
+            // payées) occupent une chambre. Une demande en attente (hôte ou
+            // paiement) ne bloque plus personne : plusieurs voyageurs peuvent
+            // demander les mêmes dates, l'hôte n'en accepte qu'une et les
+            // autres sont annulées automatiquement (voir
+            // cancelCompetingRequests()).
+            ->whereIn('status', BookingStatus::occupying())
+            ->where('check_in', '<', $checkOut)
+            ->where('check_out', '>', $checkIn)
+            ->lockForUpdate();
+
+        if ($excludeBookingId) {
+            $query->where('id', '!=', $excludeBookingId);
+        }
+
+        // Retour client 2026-09-04 : ce contrôle traitait tout chevauchement
+        // comme un conflit dur, sans jamais regarder rooms.quantity — une
+        // chambre avec 5 unités ne pouvait jamais avoir plus d'une réservation
+        // active à la fois (perte de ventes réelle). Compare désormais le
+        // nombre d'UNITÉS déjà occupées (somme de rooms_quantity — retour
+        // client 2026-09-02, Partie 4.3 : réservation multi-chambres, une
+        // réservation peut consommer plus d'une unité) au nombre d'unités
+        // disponibles.
+        $occupiedUnits = (int) $query->sum('rooms_quantity');
+        if ($occupiedUnits + $requestedQuantity > $quantity) {
+            throw new RoomNotAvailableException(
+                'Cette chambre n\'est plus disponible pour les dates sélectionnées.'
+            );
+        }
+
+        // Blocages manuels par l'hôte
+        $blocked = RoomAvailability::where('room_id', $roomId)
+            ->where('status', 'blocked')
+            ->where('date', '>=', $checkIn->toDateString())
+            ->where('date', '<', $checkOut->toDateString())
+            ->lockForUpdate()
+            ->exists();
+
+        if ($blocked) {
+            throw new RoomNotAvailableException(
+                'Le partenaire a bloqué cette période. Veuillez choisir d\'autres dates.'
+            );
+        }
+    }
+
+    /**
+     * Nombre d'unités de cette chambre encore libres sur la période — lecture seule, sans
+     * verrou : sert à AFFICHER une disponibilité (assistant IA voyageur), jamais à réserver.
+     * Mêmes règles que assertAvailable() ci-dessus, qui reste le seul contrôle faisant foi
+     * au moment de la réservation : unités occupées par les réservations confirmées, et
+     * 0 si l'hébergeur a bloqué au moins une nuit de la période.
+     */
+    public function availableUnits(Room $room, Carbon $checkIn, Carbon $checkOut): int
+    {
+        $blocked = RoomAvailability::where('room_id', $room->id)
+            ->where('status', 'blocked')
+            ->where('date', '>=', $checkIn->toDateString())
+            ->where('date', '<', $checkOut->toDateString())
+            ->exists();
+        if ($blocked) {
+            return 0;
+        }
+
+        $occupiedUnits = (int) Booking::where('room_id', $room->id)
+            ->whereIn('status', BookingStatus::occupying())
+            ->where('check_in', '<', $checkOut)
+            ->where('check_out', '>', $checkIn)
+            ->sum('rooms_quantity');
+
+        return max(0, max(1, (int) ($room->quantity ?? 1)) - $occupiedUnits);
+    }
+
+    /**
+     * Bloquer les dates dans room_availabilities après création d'une réservation.
+     * Utilise upsert pour gérer les éventuelles lignes existantes.
+     */
+    public function blockDates(int $roomId, Carbon $checkIn, Carbon $checkOut): void
+    {
+        $dates = [];
+        $cursor = $checkIn->copy();
+
+        while ($cursor->lt($checkOut)) {
+            $dates[] = [
+                'room_id'    => $roomId,
+                'date'       => $cursor->toDateString(),
+                'status'     => 'occupied',
+                'created_at' => now(),
+                'updated_at' => now(),
+            ];
+            $cursor->addDay();
+        }
+
+        if (!empty($dates)) {
+            RoomAvailability::upsert(
+                $dates,
+                ['room_id', 'date'],
+                ['status', 'updated_at']
+            );
+        }
+    }
+
+    /**
+     * Libérer les dates après annulation ou modification.
+     */
+    public function releaseDates(int $roomId, Carbon $checkIn, Carbon $checkOut): void
+    {
+        RoomAvailability::where('room_id', $roomId)
+            ->where('status', 'occupied')
+            ->where('date', '>=', $checkIn->toDateString())
+            ->where('date', '<', $checkOut->toDateString())
+            ->update(['status' => 'available', 'updated_at' => now()]);
+    }
+
+    /**
+     * Confirmer une réservation.
+     * Envoie l'email de confirmation de façon synchrone (garantie de livraison)
+     * et dispatche les autres notifications en queue.
+     */
+    public function confirm(Booking $booking, ?int $actorId = null): Booking
+    {
+        $this->transition($booking, BookingStatus::Confirmed, 'confirmed', $actorId);
+
+        // Générer le code de confirmation et le numéro de réservation si absents
+        // (doivent exister avant l'envoi des emails/WhatsApp).
+        $needsSave = false;
+        if (empty($booking->confirmation_code)) {
+            $booking->confirmation_code = \App\Models\Booking::generateConfirmationCode();
+            $needsSave = true;
+        }
+        if (empty($booking->booking_number)) {
+            $booking->booking_number = \App\Models\Booking::generateBookingNumber();
+            $needsSave = true;
+        }
+        if ($needsSave) {
+            $booking->save();
+        }
+
+        // Bloquer les dates uniquement lors de la confirmation (après paiement)
+        if ($booking->room_id) {
+            $this->blockDates(
+                $booking->room_id,
+                Carbon::parse($booking->check_in),
+                Carbon::parse($booking->check_out)
+            );
+        }
+
+        $this->cancelCompetingRequests($booking, [BookingStatus::AwaitingHostConfirmation, BookingStatus::Pending]);
+
+        $booking->load(['user', 'accommodation', 'room']);
+
+        // Email de confirmation au client — synchrone, garanti
+        // Chaque tentative est aussi tracée dans notification_logs (retour
+        // client 2026-09-02, Partie 4.3 : "événements de notification"),
+        // consultable depuis le détail admin de la réservation.
+        if ($booking->user?->email) {
+            try {
+                Mail::to($booking->user->email)->send(new BookingConfirmation($booking));
+                \App\Models\NotificationLog::record($booking->id, 'booking_confirmed', 'email', 'traveler', $booking->user->email, true);
+            } catch (\Throwable $e) {
+                Log::error('Booking confirmation email (client) failed', [
+                    'booking_id' => $booking->id,
+                    'error'      => $e->getMessage(),
+                ]);
+                \App\Models\NotificationLog::record($booking->id, 'booking_confirmed', 'email', 'traveler', $booking->user->email, false, $e->getMessage());
+            }
+        }
+
+        // Email de notification à l'hôte — synchrone, garanti
+        $hostEmail = $booking->accommodation?->host?->email;
+        if ($hostEmail) {
+            try {
+                Mail::to($hostEmail)->send(new HostNewBooking($booking));
+                \App\Models\NotificationLog::record($booking->id, 'booking_confirmed', 'email', 'host', $hostEmail, true);
+            } catch (\Throwable $e) {
+                Log::error('Booking confirmation email (host) failed', [
+                    'booking_id' => $booking->id,
+                    'error'      => $e->getMessage(),
+                ]);
+                \App\Models\NotificationLog::record($booking->id, 'booking_confirmed', 'email', 'host', $hostEmail, false, $e->getMessage());
+            }
+        }
+
+        // Notification in-app Extranet hôte (retour client 2026-09-02, Partie 4.3 :
+        // l'hôte doit voir la nouvelle réservation DANS l'Extranet, pas seulement
+        // par email/SMS externes). Best-effort : ne doit jamais bloquer la confirmation.
+        try {
+            \App\Models\Message::notifyHostNewBooking($booking);
+            \App\Models\NotificationLog::record($booking->id, 'booking_confirmed', 'in_app', 'host', null, true);
+        } catch (\Throwable $e) {
+            Log::error('Booking confirmation in-app notification (host) failed', [
+                'booking_id' => $booking->id,
+                'error'      => $e->getMessage(),
+            ]);
+            \App\Models\NotificationLog::record($booking->id, 'booking_confirmed', 'in_app', 'host', null, false, $e->getMessage());
+        }
+
+        // Confirmation par SMS (best-effort, en plus des emails)
+        try {
+            $sms = app(\App\Services\SmsService::class);
+            $sms->sendBookingConfirmationToClient($booking);
+            $sms->sendBookingNotificationToHost($booking);
+            \App\Models\NotificationLog::record($booking->id, 'booking_confirmed', 'sms', 'traveler', $booking->user?->phone, true);
+        } catch (\Throwable $e) {
+            Log::error('Booking confirmation SMS failed', [
+                'booking_id' => $booking->id,
+                'error'      => $e->getMessage(),
+            ]);
+            \App\Models\NotificationLog::record($booking->id, 'booking_confirmed', 'sms', 'traveler', $booking->user?->phone, false, $e->getMessage());
+        }
+
+        // Double confirmation : WhatsApp (best-effort, en plus de l'e-mail)
+        try {
+            app(\App\Services\WhatsAppService::class)->sendBookingConfirmation($booking);
+            \App\Models\NotificationLog::record($booking->id, 'booking_confirmed', 'whatsapp', 'traveler', $booking->user?->phone, true);
+        } catch (\Throwable $e) {
+            Log::error('Booking confirmation WhatsApp failed', [
+                'booking_id' => $booking->id,
+                'error'      => $e->getMessage(),
+            ]);
+            \App\Models\NotificationLog::record($booking->id, 'booking_confirmed', 'whatsapp', 'traveler', $booking->user?->phone, false, $e->getMessage());
+        }
+
+        // Notification in-app (database) via queue
+        dispatch(new \App\Jobs\SendBookingConfirmation($booking))
+            ->onQueue('notifications');
+
+        // Rappel J-1 via queue
+        $reminderAt = Carbon::parse($booking->check_in)->subDay();
+        if ($reminderAt->isFuture()) {
+            dispatch(new \App\Jobs\SendBookingReminder($booking))
+                ->delay($reminderAt)
+                ->onQueue('notifications');
+        }
+
+        Log::info('Booking confirmed', [
+            'booking_id' => $booking->id,
+            'actor_id'   => $actorId,
+        ]);
+
+        return $booking->fresh();
+    }
+
+    /**
+     * Annuler une réservation — libère les dates et notifie.
+     */
+    public function cancel(Booking $booking, string $reason = '', ?int $actorId = null): Booking
+    {
+        DB::transaction(function () use ($booking, $reason, $actorId) {
+            $this->transition($booking, BookingStatus::Cancelled, 'cancelled', $actorId, $reason);
+
+            if ($booking->room_id) {
+                $this->releaseDates(
+                    $booking->room_id,
+                    Carbon::parse($booking->check_in),
+                    Carbon::parse($booking->check_out)
+                );
+            }
+        });
+
+        dispatch(new \App\Jobs\SendBookingCancellation($booking, $reason))
+            ->onQueue('notifications');
+
+        return $booking->fresh();
+        // NB : l'avoir voyageur est généré par CancellationPolicyService::onBookingCancelled (appelé par le contrôleur).
+    }
+
+    /**
+     * Refus d'une réservation par l'établissement (mode "sur demande").
+     * -> Remboursement intégral automatique (le voyageur n'est pas fautif) ; PAS d'avoir.
+     */
+    public function refuse(Booking $booking, string $reason = '', ?int $actorId = null): Booking
+    {
+        DB::transaction(function () use ($booking, $reason, $actorId) {
+            $this->transition($booking, BookingStatus::Cancelled, 'cancelled', $actorId, $reason ?: "Demande refusée par l'établissement");
+
+            if ($booking->room_id) {
+                $this->releaseDates($booking->room_id, Carbon::parse($booking->check_in), Carbon::parse($booking->check_out));
+            }
+
+            $refund = (float) $booking->amount_paid;
+            $booking->update([
+                'refund_amount' => $refund,
+                'refunded_at' => $refund > 0 ? now() : null,
+                'payment_status' => $refund > 0 ? 'refunded' : $booking->payment_status,
+            ]);
+
+            if ($refund > 0) {
+                // Remboursement automatique (≤ 24h) via la passerelle : hook (dépend du client).
+                Log::info('Auto refund to process (host refusal)', ['booking_id' => $booking->id, 'amount' => $refund]);
+                // TODO: app(\App\Services\PaymentRefundService::class)->refund($booking, $refund);
+            }
+        });
+
+        dispatch(new \App\Jobs\SendBookingCancellation($booking, $reason))->onQueue('notifications');
+
+        return $booking->fresh();
+    }
+
+    /** Réservations qui se chevauchent sur la même unité (même chambre, ou "sans chambre" du même établissement). */
+    private function overlappingQuery(Booking $booking)
+    {
+        $q = Booking::where('id', '!=', $booking->id)
+            ->where('check_in', '<', $booking->check_out)
+            ->where('check_out', '>', $booking->check_in);
+
+        return $booking->room_id
+            ? $q->where('room_id', $booking->room_id)
+            : $q->whereNull('room_id')->where('accommodation_id', $booking->accommodation_id);
+    }
+
+    private function unitsCapacity(Booking $booking): int
+    {
+        return $booking->room_id
+            ? max(1, (int) (Room::find($booking->room_id)?->quantity ?? 1))
+            : 1;
+    }
+
+    /** Unités déjà engagées par d'autres réservations : confirmées, ou acceptées par l'hôte et en attente de paiement (non expirées). */
+    private function committedUnits(Booking $booking): int
+    {
+        return (int) $this->overlappingQuery($booking)
+            ->where(function ($q) {
+                $q->where('status', BookingStatus::Confirmed->value)
+                    ->orWhere(function ($pending) {
+                        $pending->where('status', BookingStatus::Pending->value)
+                            ->where(function ($notExpired) {
+                                $notExpired->whereNull('expires_at')->orWhere('expires_at', '>', now());
+                            });
+                    });
+            })
+            ->sum('rooms_quantity');
+    }
+
+    /** L'hôte peut-il accepter cette demande ? (une seule demande acceptée par unité et par période) */
+    public function canApprove(Booking $booking): bool
+    {
+        return $this->committedUnits($booking) + max(1, (int) $booking->rooms_quantity) <= $this->unitsCapacity($booking);
+    }
+
+    /**
+     * Retour client 2026-09-18 : dès qu'une demande est acceptée (ou payée),
+     * les autres demandes qui se disputent les mêmes dates sont annulées
+     * automatiquement, tant que plus aucune unité n'est disponible.
+     *
+     * @param  BookingStatus[]  $statuses  statuts des demandes concurrentes à annuler
+     */
+    public function cancelCompetingRequests(Booking $winner, array $statuses): void
+    {
+        try {
+            if ($this->committedUnits($winner) + max(1, (int) $winner->rooms_quantity) < $this->unitsCapacity($winner)) {
+                return; // il reste des unités : personne n'est évincé
+            }
+
+            $competitors = $this->overlappingQuery($winner)
+                ->whereIn('status', array_map(fn ($st) => $st->value, $statuses))
+                ->orderBy('created_at')
+                ->get();
+
+            foreach ($competitors as $competitor) {
+                $this->cancel($competitor, 'Ces dates ont été attribuées à une autre réservation.');
+            }
+        } catch (\Throwable $e) {
+            Log::error('cancelCompetingRequests failed', ['booking_id' => $winner->id, 'error' => $e->getMessage()]);
+        }
+    }
+
+    /**
+     * L'hôte confirme la disponibilité — le voyageur peut désormais payer.
+     * Retour client 2026-09-16 : parcours "confirmation hôte avant paiement".
+     * NE génère PAS le code de confirmation et NE bloque PAS les dates : ces
+     * deux effets restent exclusivement liés au paiement effectif (Confirmed,
+     * via confirm() / PaymentController::markConfirmedIfPending()).
+     */
+    public function approveAvailability(Booking $booking, ?int $actorId = null): Booking
+    {
+        $previousExpiresAt = $booking->expires_at;
+
+        DB::transaction(function () use ($booking, $actorId, $previousExpiresAt) {
+            $this->transition($booking, BookingStatus::Pending, 'host_approved', $actorId, null, [
+                'previous_expires_at' => $previousExpiresAt?->toIso8601String(),
+            ]);
+
+            // Réarme le délai de paiement (même fenêtre de 48h qu'aujourd'hui,
+            // simplement décalée dans le temps — la demande n'était jusqu'ici
+            // soumise qu'au délai de réponse de l'hôte).
+            $booking->update(['expires_at' => now()->addHours(48)]);
+        });
+
+        $this->cancelCompetingRequests($booking->fresh(), [BookingStatus::AwaitingHostConfirmation]);
+
+        $booking->load(['user', 'accommodation.host', 'room']);
+
+        try {
+            $booking->user?->notifyNow(new \App\Notifications\TravelerBookingUpdateNotification($booking, 'booking_approved'));
+        } catch (\Throwable $e) {
+            Log::error('Traveler in-app notification (approved) failed', ['booking_id' => $booking->id, 'error' => $e->getMessage()]);
+        }
+
+        if ($booking->user?->email) {
+            try {
+                Mail::to($booking->user->email)->send(new BookingApprovedPleasePay($booking));
+                \App\Models\NotificationLog::record($booking->id, 'booking_approved', 'email', 'traveler', $booking->user->email, true);
+            } catch (\Throwable $e) {
+                Log::error('Booking approved email (traveler) failed', ['booking_id' => $booking->id, 'error' => $e->getMessage()]);
+                \App\Models\NotificationLog::record($booking->id, 'booking_approved', 'email', 'traveler', $booking->user->email, false, $e->getMessage());
+            }
+        }
+
+        try {
+            $sms = app(\App\Services\SmsService::class);
+            $sms->sendApprovedPleasePayToClient($booking);
+            \App\Models\NotificationLog::record($booking->id, 'booking_approved', 'sms', 'traveler', $booking->user?->phone, true);
+        } catch (\Throwable $e) {
+            Log::error('Booking approved SMS failed', ['booking_id' => $booking->id, 'error' => $e->getMessage()]);
+            \App\Models\NotificationLog::record($booking->id, 'booking_approved', 'sms', 'traveler', $booking->user?->phone, false, $e->getMessage());
+        }
+
+        try {
+            app(\App\Services\WhatsAppService::class)->sendApprovedPleasePay($booking);
+            \App\Models\NotificationLog::record($booking->id, 'booking_approved', 'whatsapp', 'traveler', $booking->user?->phone, true);
+        } catch (\Throwable $e) {
+            Log::error('Booking approved WhatsApp failed', ['booking_id' => $booking->id, 'error' => $e->getMessage()]);
+            \App\Models\NotificationLog::record($booking->id, 'booking_approved', 'whatsapp', 'traveler', $booking->user?->phone, false, $e->getMessage());
+        }
+
+        Log::info('Booking availability approved by host', [
+            'booking_id' => $booking->id,
+            'actor_id' => $actorId,
+        ]);
+
+        return $booking->fresh();
+    }
+
+    /**
+     * Marquer une réservation comme No Show (absence de check-in).
+     * L'établissement conserve la garantie : aucun remboursement ni avoir.
+     */
+    public function markNoShow(Booking $booking, ?int $actorId = null): Booking
+    {
+        $booking->update([
+            'no_show_at' => now(),
+            'refund_amount' => 0,
+            'credit_amount' => 0,
+        ]);
+        $this->logHistory($booking, $booking->status, $booking->status, 'no_show', $actorId, 'Absence de check-in détectée — garantie conservée');
+
+        return $booking->fresh();
+    }
+
+    /**
+     * Marquer une réservation comme terminée (après check-out).
+     */
+    public function complete(Booking $booking, ?int $actorId = null): Booking
+    {
+        $this->transition($booking, BookingStatus::Completed, 'completed', $actorId);
+
+        return $booking->fresh();
+    }
+
+    /**
+     * Modifier les dates d'une réservation confirmée ou en attente.
+     * Libère les anciennes dates, vérifie les nouvelles, les bloque.
+     */
+    public function modifyDates(
+        Booking $booking,
+        Carbon $newCheckIn,
+        Carbon $newCheckOut,
+        ?int $actorId = null
+    ): Booking {
+        DB::transaction(function () use ($booking, $newCheckIn, $newCheckOut, $actorId) {
+            $oldCheckIn  = Carbon::parse($booking->check_in);
+            $oldCheckOut = Carbon::parse($booking->check_out);
+            $roomId      = $booking->room_id;
+
+            if ($roomId) {
+                // Verrou sur la chambre
+                Room::lockForUpdate()->findOrFail($roomId);
+
+                // Libérer les anciennes dates
+                $this->releaseDates($roomId, $oldCheckIn, $oldCheckOut);
+
+                // Vérifier les nouvelles (en excluant cette réservation) — même
+                // nombre d'unités que la réservation actuelle (rooms_quantity
+                // n'est pas modifiable via une simple modification de dates).
+                $this->assertAvailable($roomId, $newCheckIn, $newCheckOut, $booking->id, max(1, (int) $booking->rooms_quantity));
+
+                // Bloquer les nouvelles dates
+                $this->blockDates($roomId, $newCheckIn, $newCheckOut);
+            }
+
+            $updateData = [
+                'check_in'  => $newCheckIn->toDateString(),
+                'check_out' => $newCheckOut->toDateString(),
+                // Retour client 2026-09-02 (Partie 4.4) : indicateur "Modifiée"
+                // affiché à côté du statut principal, jamais réinitialisé.
+                'was_modified' => true,
+            ];
+
+            // Retour client 2026-09-15 : changer les dates change le nombre de
+            // nuitées, donc le prix — jusqu'ici total_price/base_price restaient
+            // figés au montant de la réservation d'origine. On remet à l'échelle
+            // proportionnellement au nouveau nombre de nuits plutôt que de
+            // rejouer tout le moteur de tarification (promotions/bon de
+            // fidélité/paliers longue durée) : le tarif par nuit réellement
+            // facturé (remise déjà appliquée, éventuellement issue d'une
+            // promotion qui n'est plus valable aujourd'hui) est préservé tel
+            // quel, seul le nombre de nuits change. Le petit-déjeuner
+            // supplémentaire est un montant forfaitaire (quantité choisie par
+            // le voyageur), pas proportionnel aux nuits : laissé inchangé.
+            // garantie/montant déjà payé (deposit_amount/amount_paid) ne sont
+            // jamais retouchés ici — seul le nouveau solde dû s'ajuste
+            // (total_price - amount_paid), sans prélèvement ni remboursement
+            // automatique.
+            $oldNights = max(1, $oldCheckIn->diffInDays($oldCheckOut));
+            $newNights = max(1, $newCheckIn->diffInDays($newCheckOut));
+            if ($oldNights !== $newNights) {
+                $extraBreakfastTotal = (float) ($booking->extra_breakfast_total ?? 0);
+                $oldRoomsPortion = (float) $booking->base_price;
+                $oldDiscountedRoomsPortion = (float) $booking->total_price - $extraBreakfastTotal;
+
+                $updateData['base_price'] = round($oldRoomsPortion / $oldNights * $newNights, 2);
+                $updateData['total_price'] = round($oldDiscountedRoomsPortion / $oldNights * $newNights, 2) + $extraBreakfastTotal;
+            }
+
+            $booking->update($updateData);
+
+            $this->logHistory($booking, $booking->status, $booking->status, 'modified', $actorId, null, [
+                'old_check_in'  => $oldCheckIn->toDateString(),
+                'old_check_out' => $oldCheckOut->toDateString(),
+                'new_check_in'  => $newCheckIn->toDateString(),
+                'new_check_out' => $newCheckOut->toDateString(),
+            ]);
+        });
+
+        return $booking->fresh();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Méthodes internes
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private function transition(
+        Booking $booking,
+        BookingStatus $to,
+        string $action,
+        ?int $actorId,
+        ?string $note = null,
+        ?array $meta = null
+    ): void {
+        if (!$booking->canTransitionTo($to)) {
+            throw new InvalidBookingTransitionException(
+                "Transition {$booking->status->value} → {$to->value} non autorisée."
+            );
+        }
+
+        $from = $booking->status;
+        $booking->referralActorId = $actorId;
+        $booking->update(['status' => $to->value]);
+        $this->logHistory($booking, $from, $to, $action, $actorId, $note, $meta);
+    }
+
+    public function logHistory(
+        Booking $booking,
+        BookingStatus $from,
+        BookingStatus $to,
+        string $action,
+        ?int $actorId = null,
+        ?string $note = null,
+        ?array $meta = null
+    ): void {
+        BookingHistory::create([
+            'booking_id'  => $booking->id,
+            'user_id'     => $actorId,
+            'from_status' => $from->value,
+            'to_status'   => $to->value,
+            'action'      => $action,
+            'note'        => $note,
+            'meta'        => $meta,
+            'ip_address'  => request()->ip(),
+        ]);
+    }
+}

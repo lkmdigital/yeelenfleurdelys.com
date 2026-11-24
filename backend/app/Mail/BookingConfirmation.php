@@ -1,0 +1,58 @@
+<?php
+
+namespace App\Mail;
+
+use App\Models\Booking;
+use Illuminate\Bus\Queueable;
+use Illuminate\Mail\Mailable;
+use Illuminate\Queue\SerializesModels;
+
+class BookingConfirmation extends Mailable
+{
+    use Queueable, SerializesModels;
+
+    public $booking;
+
+    /**
+     * Create a new message instance.
+     */
+    public function __construct(Booking $booking)
+    {
+        $this->booking = $booking;
+    }
+
+    /**
+     * Build the message.
+     */
+    public function build()
+    {
+        $reference = $this->booking->booking_number ?? $this->booking->confirmation_code ?? '#' . $this->booking->id;
+        // Lien de consultation direct (retour client 2026-09-02, Partie 4.6 :
+        // "un lien de consultation") — absent jusqu'ici, seul un lien générique
+        // vers yeelenfleurdelys.com figurait dans l'e-mail.
+        $frontend = rtrim(config('services.frontend_url', 'https://yeelenfleurdelys.com'), '/');
+        $bookingUrl = "{$frontend}/bookings/{$this->booking->access_token}";
+
+        $mail = $this->subject('Votre réservation Yeelen & Fleur de Lys est confirmée — ' . $reference)
+                    ->view('emails.booking-confirmation')
+                    ->with([
+                        'booking'       => $this->booking,
+                        'accommodation' => $this->booking->accommodation,
+                        'room'          => $this->booking->room,
+                        'user'          => $this->booking->user,
+                        'bookingUrl'    => $bookingUrl,
+                        'lookupUrl'     => "{$frontend}/retrouver-reservation",
+                    ]);
+
+        // Reçu de paiement en PDF en pièce jointe (retour client 2026-09-21).
+        $pdf = \App\Services\ReceiptPdfService::forBooking($this->booking);
+        if ($pdf !== null) {
+            $mail->attachData($pdf, 'recu-yfl-' . preg_replace('/[^A-Za-z0-9_-]/', '', (string) $reference) . '.pdf', ['mime' => 'application/pdf']);
+        }
+
+        return $mail;
+    }
+}
+
+
+

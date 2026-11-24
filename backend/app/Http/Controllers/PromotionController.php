@@ -1,0 +1,304 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Promotion;
+use App\Models\Accommodation;
+use App\Models\Favorite;
+use App\Models\Room;
+use App\Models\User;
+use App\Notifications\NewPromotionForFavoriteNotification;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Validator;
+use Carbon\Carbon;
+
+class PromotionController extends Controller
+{
+    /**
+     * Liste des promotions d'un établissement
+     */
+    public function index(Request $request, $accommodationId)
+    {
+        $accommodation = Accommodation::findOrFail($accommodationId);
+        $user = $request->user();
+
+        try {
+            // Si l'utilisateur est authentifié et est propriétaire ou admin, retourner toutes les promotions
+            if ($user && ($user->isAdmin() || $accommodation->host_id === $user->hostScopeId())) {
+                $promotions = Promotion::where('accommodation_id', $accommodationId)
+                    ->with(['room'])
+                    ->orderBy('start_date', 'desc')
+                    ->get();
+            } else {
+                // Public: retourner uniquement les promotions actives et valides
+                $today = now()->toDateString();
+                $promotions = Promotion::where('accommodation_id', $accommodationId)
+                    ->where('is_active', true)
+                    ->where('start_date', '<=', $today)
+                    ->where('end_date', '>=', $today)
+                    ->with(['room'])
+                    ->orderBy('discount_percent', 'desc')
+                    ->get();
+            }
+
+            return response()->json($promotions);
+        } catch (\Illuminate\Database\QueryException $e) {
+            // Si la table promotions n'existe pas encore, retourner un tableau vide
+            return response()->json([]);
+        }
+    }
+
+    /**
+     * Créer une nouvelle promotion
+     */
+    public function store(Request $request, $accommodationId)
+    {
+        $accommodation = Accommodation::findOrFail($accommodationId);
+
+        // Vérifier que l'utilisateur est le propriétaire ou admin
+        if (!$request->user()->isAdmin() && $accommodation->host_id !== $request->user()->hostScopeId()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+
+        $validator = Validator::make($request->all(), [
+            'room_id' => 'nullable|exists:rooms,id',
+            'discount_type' => 'nullable|string|in:percent,fixed,free_night',
+            'discount_percent' => 'required_if:discount_type,percent|nullable|numeric|min:1|max:100',
+            'discount_amount' => 'required_if:discount_type,fixed|nullable|numeric|min:1',
+            'min_stay_nights' => 'nullable|integer|min:1|max:365',
+            'promo_code' => 'nullable|string|max:100|alpha_dash',
+            'start_date' => 'required|date|after_or_equal:today',
+            'end_date' => 'required|date|after:start_date',
+            'description' => 'nullable|string|max:500',
+            'members_only' => 'nullable|boolean',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'message' => 'Validation error',
+                'errors' => $validator->errors()
+            ], 422);
+        }
+
+        // Vérifier que la chambre appartient bien à l'établissement si room_id est fourni
+        if ($request->room_id) {
+            $room = Room::where('id', $request->room_id)
+                ->where('accommodation_id', $accommodationId)
+                ->first();
+
+            if (!$room) {
+                return response()->json([
+                    'message' => 'La chambre spécifiée n\'appartient pas à cet établissement'
+                ], 422);
+            }
+        }
+
+        $discountType = $request->input('discount_type', 'percent');
+
+        $promotion = Promotion::create([
+            'accommodation_id' => $accommodationId,
+            'room_id' => $request->room_id,
+            'discount_type' => $discountType,
+            // discount_percent est NOT NULL en base (colonne historique) : 0 quand non applicable.
+            'discount_percent' => $discountType === 'percent' ? $request->discount_percent : 0,
+            'discount_amount' => $discountType === 'fixed' ? $request->discount_amount : null,
+            'min_stay_nights' => $request->min_stay_nights,
+            'promo_code' => $request->promo_code ? strtoupper($request->promo_code) : null,
+            'start_date' => $request->start_date,
+            'end_date' => $request->end_date,
+            'description' => $request->description,
+            'is_active' => true,
+            'members_only' => $request->boolean('members_only'),
+        ]);
+
+        $this->notifyFavoritesOfNewPromotion($promotion);
+
+        return response()->json($promotion->load('room'), 201);
+    }
+
+    /**
+     * §3.12 du doc "MODULE IA YEELEN & FLEUR DE LYS" ("nouvelles promotions" parmi les
+     * alertes intelligentes) : prévient les voyageurs ayant mis cet
+     * établissement en favori. Best-effort — un échec d'envoi ne doit
+     * jamais faire échouer la création de la promotion.
+     */
+    private function notifyFavoritesOfNewPromotion(Promotion $promotion): void
+    {
+        $userIds = Favorite::where('accommodation_id', $promotion->accommodation_id)->pluck('user_id');
+        if ($userIds->isEmpty()) {
+            return;
+        }
+
+        $promotion->loadMissing('accommodation:id,name');
+
+        foreach (User::whereIn('id', $userIds)->get() as $user) {
+            try {
+                $user->notify(new NewPromotionForFavoriteNotification($promotion));
+            } catch (\Throwable $e) {
+                Log::warning('Échec notification nouvelle promo (favori)', [
+                    'user_id' => $user->id,
+                    'promotion_id' => $promotion->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+    }
+
+    /**
+     * Mettre à jour une promotion
+     */
+    public function update(Request $request, $accommodationId, $promotionId)
+    {
+        $accommodation = Accommodation::findOrFail($accommodationId);
+        $promotion = Promotion::findOrFail($promotionId);
+
+        // Vérifier que la promotion appartient à l'établissement
+        if ($promotion->accommodation_id != $accommodationId) {
+            return response()->json(['message' => 'Promotion not found'], 404);
+        }
+
+        // Vérifier que l'utilisateur est le propriétaire ou admin
+        if (!$request->user()->isAdmin() && $accommodation->host_id !== $request->user()->hostScopeId()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+
+        $validator = Validator::make($request->all(), [
+            'room_id' => 'nullable|exists:rooms,id',
+            'discount_type' => 'sometimes|string|in:percent,fixed,free_night',
+            'discount_percent' => 'sometimes|nullable|numeric|min:1|max:100',
+            'discount_amount' => 'sometimes|nullable|numeric|min:1',
+            'min_stay_nights' => 'sometimes|nullable|integer|min:1|max:365',
+            'promo_code' => 'sometimes|nullable|string|max:100|alpha_dash',
+            'start_date' => 'sometimes|date',
+            'end_date' => 'sometimes|date|after:start_date',
+            'description' => 'nullable|string|max:500',
+            'is_active' => 'sometimes|boolean',
+            'members_only' => 'sometimes|boolean',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'message' => 'Validation error',
+                'errors' => $validator->errors()
+            ], 422);
+        }
+
+        // Vérifier que la chambre appartient bien à l'établissement si room_id est fourni
+        if ($request->has('room_id') && $request->room_id) {
+            $room = Room::where('id', $request->room_id)
+                ->where('accommodation_id', $accommodationId)
+                ->first();
+
+            if (!$room) {
+                return response()->json([
+                    'message' => 'La chambre spécifiée n\'appartient pas à cet établissement'
+                ], 422);
+            }
+        }
+
+        $updateData = $request->only([
+            'room_id',
+            'discount_type',
+            'discount_percent',
+            'discount_amount',
+            'min_stay_nights',
+            'start_date',
+            'end_date',
+            'description',
+            'is_active',
+            'members_only',
+        ]);
+        // discount_percent est NOT NULL en base : jamais null, 0 si non applicable.
+        if (array_key_exists('discount_percent', $updateData) && $updateData['discount_percent'] === null) {
+            $updateData['discount_percent'] = 0;
+        }
+        if ($request->has('promo_code')) {
+            $updateData['promo_code'] = $request->promo_code ? strtoupper($request->promo_code) : null;
+        }
+
+        $promotion->update($updateData);
+
+        return response()->json($promotion->load('room'));
+    }
+
+    /**
+     * Supprimer une promotion
+     */
+    public function destroy(Request $request, $accommodationId, $promotionId)
+    {
+        $accommodation = Accommodation::findOrFail($accommodationId);
+        $promotion = Promotion::findOrFail($promotionId);
+
+        // Vérifier que la promotion appartient à l'établissement
+        if ($promotion->accommodation_id != $accommodationId) {
+            return response()->json(['message' => 'Promotion not found'], 404);
+        }
+
+        // Vérifier que l'utilisateur est le propriétaire ou admin
+        if (!$request->user()->isAdmin() && $accommodation->host_id !== $request->user()->hostScopeId()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+
+        $promotion->delete();
+
+        return response()->json(['message' => 'Promotion supprimée avec succès']);
+    }
+
+    /**
+     * Activer/Désactiver une promotion
+     */
+    public function toggle(Request $request, $accommodationId, $promotionId)
+    {
+        $accommodation = Accommodation::findOrFail($accommodationId);
+        $promotion = Promotion::findOrFail($promotionId);
+
+        // Vérifier que la promotion appartient à l'établissement
+        if ($promotion->accommodation_id != $accommodationId) {
+            return response()->json(['message' => 'Promotion not found'], 404);
+        }
+
+        // Vérifier que l'utilisateur est le propriétaire ou admin
+        if (!$request->user()->isAdmin() && $accommodation->host_id !== $request->user()->hostScopeId()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+
+        $promotion->is_active = !$promotion->is_active;
+        $promotion->save();
+
+        return response()->json($promotion->load('room'));
+    }
+
+    /**
+     * Suivi de performance d'une promotion (brief Étape 33) : réservations générées
+     * et chiffre d'affaires associé. Pas de "taux de conversion" — aucune trace des
+     * vues/impressions n'existe dans la plateforme, on ne fabrique pas cette mesure.
+     */
+    public function stats(Request $request, $accommodationId, $promotionId)
+    {
+        $accommodation = Accommodation::findOrFail($accommodationId);
+        $promotion = Promotion::findOrFail($promotionId);
+
+        if ($promotion->accommodation_id != $accommodationId) {
+            return response()->json(['message' => 'Promotion not found'], 404);
+        }
+
+        if (!$request->user()->isAdmin() && $accommodation->host_id !== $request->user()->hostScopeId()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+
+        $bookings = $promotion->bookings()->whereIn('status', ['confirmed', 'completed'])->get();
+
+        return response()->json([
+            'bookings_count' => $bookings->count(),
+            'revenue_generated' => (float) $bookings->sum('total_price'),
+        ]);
+    }
+}
+
+
+
+
+
+
+

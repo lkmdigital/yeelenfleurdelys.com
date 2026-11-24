@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" role="img" aria-label="Photos à venir">
+  <rect width="800" height="500" fill="#E5E7EB"/>
+  <g fill="none" stroke="#9CA3AF" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" transform="translate(340 180)">
+    <path d="M10 110V20M10 70h120v40M130 110V70"/>
+    <path d="M30 70V50a10 10 0 0 1 10-10h30a10 10 0 0 1 10 10v20"/>
+  </g>
+  <text x="400" y="350" text-anchor="middle" font-family="system-ui, sans-serif" font-size="28" fill="#6B7280">Photos à venir</text>
+</svg>

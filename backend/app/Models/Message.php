@@ -1,0 +1,217 @@
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+
+class Message extends Model
+{
+    protected $fillable = [
+        'recipient_id',
+        'sender_id',
+        'is_from_platform',
+        'subject',
+        'body',
+        'read_at',
+        'parent_id',
+        'booking_id',
+    ];
+
+    protected function casts(): array
+    {
+        return [
+            'is_from_platform' => 'boolean',
+            'read_at' => 'datetime',
+        ];
+    }
+
+    public function recipient(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'recipient_id');
+    }
+
+    public function sender(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'sender_id');
+    }
+
+    public function parent(): BelongsTo
+    {
+        return $this->belongsTo(Message::class, 'parent_id');
+    }
+
+    public function replies(): \Illuminate\Database\Eloquent\Relations\HasMany
+    {
+        return $this->hasMany(Message::class, 'parent_id');
+    }
+
+    public function booking(): BelongsTo
+    {
+        return $this->belongsTo(Booking::class);
+    }
+
+    /**
+     * Retour client 2026-09-02 (Partie 4.3) : l'hôte doit être notifié
+     * DANS l'Extranet (pas seulement par email/SMS externes) pour chaque
+     * nouvelle réservation, modification et annulation. L'Extranet hôte
+     * (frontend/app/dashboard/host/inbox) lit ce modèle Message par
+     * recipient_id — voir Host/HostInboxController::index(). Centralisé ici
+     * en helpers statiques (même pattern que NotificationLog::record) pour
+     * être appelé depuis les deux chemins réels de confirmation
+     * (BookingService::confirm() ET PaymentController::sendBookingEmails(),
+     * qui sont deux implémentations parallèles distinctes) sans dupliquer
+     * le texte.
+     */
+    public static function notifyHostNewBooking(Booking $booking): void
+    {
+        $hostId = $booking->accommodation?->host_id;
+        if (!$hostId) {
+            return;
+        }
+        $accommodationName = $booking->accommodation?->name ?? 'votre établissement';
+        $checkIn = $booking->check_in ? $booking->check_in->format('d/m/Y') : '—';
+        $checkOut = $booking->check_out ? $booking->check_out->format('d/m/Y') : '—';
+
+        self::create([
+            'recipient_id' => $hostId,
+            'sender_id' => null,
+            'is_from_platform' => true,
+            'subject' => 'Nouvelle réservation confirmée',
+            'body' => "Une nouvelle réservation vient d'être confirmée pour " . $accommodationName . ".\n\n"
+                . "Séjour du " . $checkIn . " au " . $checkOut . " — " . ($booking->guests ?? 1) . " voyageur(s).\n"
+                . ($booking->roomsSummary() ? "Chambre(s) : " . $booking->roomsSummary() . ".\n" : '')
+                . "\n"
+                . "Réservation #" . $booking->id . ".",
+            'booking_id' => $booking->id,
+        ]);
+    }
+
+    /**
+     * Nouvelle DEMANDE de réservation — distincte de notifyHostNewBooking
+     * (réservation déjà confirmée). Retour client 2026-09-16 : l'hôte doit
+     * confirmer la disponibilité avant tout paiement.
+     */
+    public static function notifyHostNewRequest(Booking $booking): void
+    {
+        $hostId = $booking->accommodation?->host_id;
+        if (!$hostId) {
+            return;
+        }
+        $accommodationName = $booking->accommodation?->name ?? 'votre établissement';
+        $checkIn = $booking->check_in ? $booking->check_in->format('d/m/Y') : '—';
+        $checkOut = $booking->check_out ? $booking->check_out->format('d/m/Y') : '—';
+        $deadline = $booking->expires_at ? $booking->expires_at->format('d/m/Y à H:i') : '—';
+
+        self::create([
+            'recipient_id' => $hostId,
+            'sender_id' => null,
+            'is_from_platform' => true,
+            'subject' => 'Nouvelle demande de réservation — à confirmer',
+            'body' => "Un voyageur souhaite réserver " . $accommodationName . ".\n\n"
+                . "Séjour du " . $checkIn . " au " . $checkOut . " — " . ($booking->guests ?? 1) . " voyageur(s).\n"
+                . ($booking->roomsSummary() ? "Chambre(s) : " . $booking->roomsSummary() . ".\n" : '')
+                . "\n"
+                . "Merci de confirmer la disponibilité avant le " . $deadline . " (sinon la demande sera annulée automatiquement).\n\n"
+                . "Demande #" . $booking->id . ".",
+            'booking_id' => $booking->id,
+        ]);
+    }
+
+    public static function notifyHostBookingModified(Booking $booking, string $summary = ''): void
+    {
+        $hostId = $booking->accommodation?->host_id;
+        if (!$hostId) {
+            return;
+        }
+        $accommodationName = $booking->accommodation?->name ?? 'votre établissement';
+
+        self::create([
+            'recipient_id' => $hostId,
+            'sender_id' => null,
+            'is_from_platform' => true,
+            'subject' => 'Réservation modifiée',
+            'body' => "La réservation #" . $booking->id . " (" . $accommodationName . ") a été modifiée."
+                . ($summary ? "\n\n" . $summary : ''),
+            'booking_id' => $booking->id,
+        ]);
+    }
+
+    public static function notifyHostBookingCancelled(Booking $booking, string $reason = ''): void
+    {
+        $hostId = $booking->accommodation?->host_id;
+        if (!$hostId) {
+            return;
+        }
+        $accommodationName = $booking->accommodation?->name ?? 'votre établissement';
+
+        self::create([
+            'recipient_id' => $hostId,
+            'sender_id' => null,
+            'is_from_platform' => true,
+            'subject' => 'Réservation annulée',
+            'body' => "La réservation #" . $booking->id . " (" . $accommodationName . ") a été annulée."
+                . ($reason ? "\n\nMotif : " . $reason : ''),
+            'booking_id' => $booking->id,
+        ]);
+    }
+
+    /**
+     * Demande utilisateur 2026-09-13 : vérifier que l'admin approuve bien un
+     * établissement avant qu'il n'intègre la plateforme — révèle un manque
+     * réel en creusant : ni l'approbation ni le rejet d'un établissement ne
+     * prévenaient l'hôte (AdminAccommodationController::approve()/reject()
+     * ne faisaient qu'un audit log, jamais consulté par l'hôte). Même
+     * pattern que les notifications de réservation ci-dessus.
+     */
+    public static function notifyHostAccommodationApproved(Accommodation $accommodation): void
+    {
+        if (!$accommodation->host_id) {
+            return;
+        }
+        self::create([
+            'recipient_id' => $accommodation->host_id,
+            'sender_id' => null,
+            'is_from_platform' => true,
+            'subject' => 'Établissement approuvé',
+            'body' => "Bonne nouvelle : votre établissement « " . $accommodation->name . " » a été approuvé par l'équipe Yeelen & Fleur de Lys et est désormais visible et réservable sur la plateforme.",
+        ]);
+    }
+
+    public static function notifyHostAccommodationRejected(Accommodation $accommodation, string $reason = ''): void
+    {
+        if (!$accommodation->host_id) {
+            return;
+        }
+        self::create([
+            'recipient_id' => $accommodation->host_id,
+            'sender_id' => null,
+            'is_from_platform' => true,
+            'subject' => 'Établissement non approuvé',
+            'body' => "Votre établissement « " . $accommodation->name . " » n'a pas été approuvé pour le moment."
+                . ($reason ? "\n\nMotif : " . $reason : '')
+                . "\n\nVous pouvez corriger les informations concernées puis contacter le support pour une nouvelle vérification.",
+        ]);
+    }
+
+    /**
+     * Demande utilisateur 2026-09-13/14 : rappel de mise à jour des
+     * informations pour un établissement non à jour (voir
+     * Accommodation::needsInfoUpdate() et RemindAccommodationInfoUpdate).
+     */
+    public static function notifyHostAccommodationInfoOutdated(Accommodation $accommodation): void
+    {
+        if (!$accommodation->host_id) {
+            return;
+        }
+        self::create([
+            'recipient_id' => $accommodation->host_id,
+            'sender_id' => null,
+            'is_from_platform' => true,
+            'subject' => 'Merci de confirmer les informations de votre établissement',
+            'body' => "Les informations de « " . $accommodation->name . " » n'ont pas été confirmées depuis plusieurs mois. "
+                . "Merci de vérifier que les tarifs, disponibilités, photos et équipements sont toujours exacts, "
+                . "puis de les mettre à jour ou de confirmer qu'ils le sont toujours, depuis votre Extranet.",
+        ]);
+    }
+}
