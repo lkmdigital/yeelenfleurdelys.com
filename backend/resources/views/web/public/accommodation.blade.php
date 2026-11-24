@@ -7,11 +7,11 @@
     $policy = $hours == 0 ? 'Non remboursable : aucune annulation gratuite.' : "Annulation gratuite jusqu'à {$hours} h avant l'arrivée.";
     $wa = $acc['whatsapp'] ? preg_replace('/\D/', '', $acc['whatsapp']) : null;
     if ($wa && strlen($wa) === 10) $wa = '225' . $wa;
-    $hasDates = $search['check_in'] && $search['check_out'];
-    $availableCount = collect($rooms)->filter(fn ($r) => ($r['is_available'] ?? true) !== false)->count();
+    $services = \App\Support\EstablishmentServices::for($acc);
+    $waText = fn (string $m) => 'https://wa.me/' . $wa . '?text=' . rawurlencode($m);
 @endphp
 <x-layouts.public :title="$acc['name']" :description="\Illuminate\Support\Str::limit($acc['description'] ?? '', 155)">
-    <div class="mx-auto max-w-7xl px-4 py-8">
+    <div class="mx-auto max-w-7xl px-4 pt-6 md:py-8">
         <a href="{{ route('home') }}#etablissements" class="link inline-flex items-center gap-1 text-sm"><x-icon name="arrow-left" class="h-4 w-4" /> Tous nos établissements</a>
 
         <div class="mt-4 flex flex-wrap items-start justify-between gap-4">
@@ -41,33 +41,10 @@
                     </section>
                 @endif
 
-                @if (!empty($acc['amenities']))
-                    <section>
-                        <h2 class="section-title">Équipements</h2>
-                        <ul class="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">
-                            @foreach ($acc['amenities'] as $a)
-                                <li class="flex items-center gap-2 text-sm"><x-icon name="check" class="h-4 w-4 text-primary" /> {{ Fmt::amenity($a) }}</li>
-                            @endforeach
-                            @if ($acc['reception_24h'] ?? false)<li class="flex items-center gap-2 text-sm"><x-icon name="check" class="h-4 w-4 text-primary" /> Réception 24 h/24</li>@endif
-                            @if ($acc['shuttle_service'] ?? false)<li class="flex items-center gap-2 text-sm"><x-icon name="check" class="h-4 w-4 text-primary" /> Navette</li>@endif
-                            @if ($acc['laundry'] ?? false)<li class="flex items-center gap-2 text-sm"><x-icon name="check" class="h-4 w-4 text-primary" /> Blanchisserie</li>@endif
-                        </ul>
-                    </section>
-                @endif
 
                 <section id="chambres" class="scroll-mt-20">
-                    <div class="flex flex-wrap items-end justify-between gap-2">
-                        <h2 class="section-title">Chambres et tarifs</h2>
-                        @if ($hasDates)
-                            <p class="text-sm text-gray-600 dark:text-gray-400">Du {{ Fmt::date($search['check_in']) }} au {{ Fmt::date($search['check_out']) }} · {{ $availableCount }} disponible(s)</p>
-                        @endif
-                    </div>
-                    <form method="GET" action="{{ route('accommodations.show', $acc['id']) }}#chambres" class="card mt-4 grid gap-3 sm:grid-cols-4 sm:items-end">
-                        <x-input name="check_in" type="date" label="Arrivée" :value="$search['check_in']" :min="now()->toDateString()" required />
-                        <x-input name="check_out" type="date" label="Départ" :value="$search['check_out']" :min="now()->addDay()->toDateString()" required />
-                        <x-input name="guests" type="number" label="Voyageurs" :value="$search['guests']" min="1" max="20" />
-                        <button type="submit" class="btn-primary">Vérifier</button>
-                    </form>
+                    <h2 class="section-title">Nos chambres</h2>
+                    <p class="mt-1 text-sm text-gray-600 dark:text-gray-400">Choisissez votre chambre : vous indiquerez ensuite vos dates et le nombre de personnes.</p>
 
                     @if (!$rooms && $onRequest)
                         <div class="card mt-4 divide-y divide-gray-200 dark:divide-gray-800">
@@ -88,11 +65,47 @@
                                 @include('web.partials.room-request-card', ['room' => $room])
                             @endforeach
                         </div>
-                        @if ($hasDates && $availableCount === 0)
-                            <p class="mt-3 rounded-lg border border-yellow-200 bg-yellow-50 px-4 py-3 text-sm text-yellow-800">Aucune chambre disponible pour ces dates. Essayez d'autres dates.</p>
-                        @endif
                     @endif
                 </section>
+
+                @if ($services)
+                    <section id="services" class="scroll-mt-20">
+                        <h2 class="section-title">Nos services</h2>
+                        <p class="mt-1 text-sm text-gray-600 dark:text-gray-400">Sur devis : écrivez-nous, nous vous répondons rapidement.</p>
+                        <div class="mt-4 grid gap-3 sm:grid-cols-2">
+                            @foreach ($services as $sv)
+                                <div class="card flex flex-col p-4">
+                                    <div class="flex items-start gap-3">
+                                        <span class="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary"><x-icon :name="$sv['icon']" class="h-5 w-5" /></span>
+                                        <div class="min-w-0">
+                                            <h3 class="font-semibold">{{ $sv['title'] }}</h3>
+                                            <p class="mt-0.5 text-sm text-gray-600 dark:text-gray-400">{{ $sv['text'] }}</p>
+                                        </div>
+                                    </div>
+                                    @if ($wa)
+                                        <a href="{{ $waText($sv['message']) }}" target="_blank" rel="noopener noreferrer" class="btn-secondary mt-4 w-full"><x-icon name="message-circle" class="h-4 w-4" /> Demander un devis</a>
+                                    @else
+                                        <a href="{{ route('contact') }}" class="btn-secondary mt-4 w-full"><x-icon name="mail" class="h-4 w-4" /> Demander un devis</a>
+                                    @endif
+                                </div>
+                            @endforeach
+                        </div>
+                    </section>
+                @endif
+
+                @if (!empty($acc['amenities']))
+                    <section>
+                        <h2 class="section-title">Équipements</h2>
+                        <ul class="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">
+                            @foreach ($acc['amenities'] as $a)
+                                <li class="flex items-center gap-2 text-sm"><x-icon name="check" class="h-4 w-4 text-primary" /> {{ Fmt::amenity($a) }}</li>
+                            @endforeach
+                            @if ($acc['reception_24h'] ?? false)<li class="flex items-center gap-2 text-sm"><x-icon name="check" class="h-4 w-4 text-primary" /> Réception 24 h/24</li>@endif
+                            @if ($acc['shuttle_service'] ?? false)<li class="flex items-center gap-2 text-sm"><x-icon name="check" class="h-4 w-4 text-primary" /> Navette</li>@endif
+                            @if ($acc['laundry'] ?? false)<li class="flex items-center gap-2 text-sm"><x-icon name="check" class="h-4 w-4 text-primary" /> Blanchisserie</li>@endif
+                        </ul>
+                    </section>
+                @endif
 
                 @if ($quote && ($quote['variants']['enabled'] ?? false))
                     <section>
@@ -164,7 +177,7 @@
             </div>
 
             <aside class="space-y-4 lg:sticky lg:top-20">
-                <div class="card">
+                <div class="card hidden lg:block">
                     @if ($from > 0)
                         <p class="text-sm text-gray-600 dark:text-gray-400">À partir de</p>
                         <p class="text-2xl font-bold">{{ Fmt::price($from) }} <span class="text-sm font-normal text-gray-500">/ nuit</span></p>
@@ -174,7 +187,7 @@
                     @if (!empty($acc['guarantee']['enabled']))
                         <p class="mt-3 flex gap-2 text-sm text-gray-700 dark:text-gray-300"><x-icon name="shield-check" class="mt-0.5 h-4 w-4 shrink-0 text-primary" /> Garantie : {{ $acc['guarantee']['summary'] }} payée en ligne, le solde à l'arrivée.</p>
                     @endif
-                    <a href="#chambres" class="btn-primary mt-4 w-full">Choisir une chambre</a>
+                    <a href="#chambres" class="btn-primary mt-4 w-full">Voir les chambres</a>
                 </div>
                 <div class="card">
                     <h2 class="font-semibold">Contacter l'établissement</h2>
@@ -190,6 +203,19 @@
                     @endif
                 </div>
             </aside>
+        </div>
+
+        {{-- Mobile : rappel du prix et accès direct aux chambres, toujours sous le pouce. --}}
+        <div class="sticky bottom-0 z-30 -mx-4 mt-8 flex items-center justify-between gap-3 border-t border-gray-200 bg-white/95 px-4 py-3 backdrop-blur lg:hidden dark:border-gray-800 dark:bg-gray-950/95">
+            <p class="min-w-0 leading-tight">
+                @if ($from > 0)
+                    <span class="block text-xs text-gray-500">À partir de</span>
+                    <span class="font-bold">{{ Fmt::price($from) }}</span> <span class="text-xs text-gray-500">/ nuit</span>
+                @else
+                    <span class="text-sm font-semibold">Tarifs sur demande</span>
+                @endif
+            </p>
+            <a href="#chambres" class="btn-primary shrink-0">Voir les chambres</a>
         </div>
     </div>
 </x-layouts.public>

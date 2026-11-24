@@ -14,8 +14,8 @@
                  sizes="100vw" alt="" aria-hidden="true" @if ($i > 0) loading="lazy" @endif
                  class="hero-slide absolute inset-0 -z-20 h-full w-full object-cover" style="--i: {{ $i }}">
         @endforeach
-        {{-- Mobile : voile jaune léger, limité au bas de la photo (juste derrière le texte). Desktop : plus marqué. --}}
-        <div class="absolute inset-0 -z-10 bg-gradient-to-t from-secondary/85 via-secondary/35 via-30% to-transparent to-60% md:from-secondary md:via-secondary/60 md:via-50% md:to-100%"></div>
+        {{-- Voile jaune léger, limité au bas de la photo (juste derrière le texte), mobile comme ordinateur. --}}
+        <div class="absolute inset-0 -z-10 bg-gradient-to-t from-secondary/85 via-secondary/35 via-30% to-transparent to-60%"></div>
 
         <div class="mx-auto w-full max-w-7xl px-4 pb-12 md:pb-16">
             <h1 class="max-w-4xl font-title text-4xl font-extrabold leading-[1.05] md:text-7xl">Hôtel Fleur de Lys &amp; Résidences Yeelen</h1>

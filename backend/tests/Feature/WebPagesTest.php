@@ -50,10 +50,15 @@ class WebPagesTest extends TestCase
             '/', '/accommodations', "/accommodations/{$this->fdl->id}", "/rooms/{$room->id}",
             '/faq', '/help', '/contact', '/cgu', '/retrouver-reservation',
             '/auth/login', '/auth/register', '/auth/forgot-password', '/auth/activate',
-            "/bookings/new?room_id={$room->id}", '/review/booking/inconnu', '/bookings/inconnu',
+            "/bookings/new?room_id={$room->id}&check_in=" . now()->addDays(30)->toDateString() . '&check_out=' . now()->addDays(32)->toDateString(),
+            '/review/booking/inconnu', '/bookings/inconnu',
         ] as $url) {
             $this->get($url)->assertOk();
         }
+
+        // Parcours : sans dates, la réservation renvoie vers la page de la chambre pour les choisir.
+        $this->get("/bookings/new?room_id={$room->id}&guests=2")
+            ->assertRedirect(route('rooms.show', ['id' => $room->id, 'guests' => 2]));
     }
 
     public function test_client_pages_render(): void

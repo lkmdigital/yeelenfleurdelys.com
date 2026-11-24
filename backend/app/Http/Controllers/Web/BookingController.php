@@ -31,6 +31,10 @@ class BookingController extends Controller
         $in = $request->query('check_in');
         $out = $request->query('check_out');
         $datesOk = $this->isDate($in) && $this->isDate($out) && $in >= now()->toDateString() && $out > $in;
+        // Parcours : les dates se choisissent sur la page de la chambre. Sans dates valides, on y renvoie.
+        if (!$datesOk && $room) {
+            return redirect()->route('rooms.show', array_filter(['id' => $room['id'], 'guests' => $request->integer('guests') ?: null]));
+        }
         if (!$datesOk) {
             $in = now()->addDay()->toDateString();
             $out = now()->addDays(2)->toDateString();

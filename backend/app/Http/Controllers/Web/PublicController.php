@@ -50,8 +50,10 @@ class PublicController extends Controller
         abort_unless($res->ok(), $res->status() === 404 ? 404 : 503);
         $acc = $res->json();
 
+        // Toutes les chambres de l'établissement, sans demander de dates : le client choisit
+        // d'abord sa chambre, puis configure son séjour (dates, voyageurs) sur la page chambre.
         $search = $this->searchParams($request);
-        $rooms = InternalApi::get("accommodations/{$acc['id']}/rooms", array_filter($search))->json();
+        $rooms = InternalApi::get("accommodations/{$acc['id']}/rooms")->json();
         $rooms = is_array($rooms) && array_is_list($rooms) ? $rooms : [];
         usort($rooms, fn ($a, $b) => ($a['effective_price_per_night'] ?? $a['price_per_night']) <=> ($b['effective_price_per_night'] ?? $b['price_per_night']));
 

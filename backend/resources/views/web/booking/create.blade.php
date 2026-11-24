@@ -7,16 +7,30 @@
 @endphp
 <x-layouts.public title="Réserver">
     <div class="mx-auto max-w-6xl px-4 py-8">
-        <a href="{{ route('accommodations.show', ['id' => $acc['id'], 'check_in' => $search['check_in'], 'check_out' => $search['check_out'], 'guests' => $search['guests']]) }}#chambres" class="link inline-flex items-center gap-1 text-sm"><x-icon name="arrow-left" class="h-4 w-4" /> {{ $acc['name'] }}</a>
+        <a href="{{ $room ? route('rooms.show', array_filter(['id' => $room['id'], 'check_in' => $search['check_in'], 'check_out' => $search['check_out'], 'guests' => $search['guests']])) : route('accommodations.show', $acc['id']) }}" class="link inline-flex items-center gap-1 text-sm"><x-icon name="arrow-left" class="h-4 w-4" /> {{ $room['name'] ?? $acc['name'] }}</a>
         <h1 class="page-title mt-3">Finaliser votre réservation</h1>
 
         <div class="mt-6 grid items-start gap-8 lg:grid-cols-[1fr_360px]">
             <div class="min-w-0 space-y-6">
                 <x-flash />
 
-                {{-- 1. Dates (formulaire séparé : seules les dates passent dans l'adresse) --}}
+                {{-- 1. Séjour : choisi sur la page de la chambre, rappelé ici avec un lien pour le modifier --}}
                 <section class="card">
                     <h2 class="section-title flex items-center gap-2"><span class="flex h-7 w-7 items-center justify-center rounded-full bg-primary text-sm text-white">1</span> Votre séjour</h2>
+                    @if ($room)
+                        <div class="mt-4 flex items-start gap-3">
+                            @if ($img)<img src="{{ $img }}" alt="" class="h-16 w-20 shrink-0 rounded-lg object-cover">@else<img src="{{ \App\Support\DemoPhotos::room($acc, $room, 300)[0] }}" alt="" class="h-16 w-20 shrink-0 rounded-lg object-cover">@endif
+                            <div class="min-w-0 flex-1 text-sm">
+                                <p class="font-semibold">{{ $room['name'] }}@if ($search['rooms_quantity'] > 1) × {{ $search['rooms_quantity'] }}@endif</p>
+                                <p class="text-gray-600 dark:text-gray-400">{{ Fmt::dateLong($search['check_in']) }} → {{ Fmt::dateLong($search['check_out']) }}</p>
+                                <p class="text-gray-600 dark:text-gray-400">{{ $nights }} {{ $nights > 1 ? 'nuits' : 'nuit' }} · {{ $search['guests'] }} {{ $search['guests'] > 1 ? 'personnes' : 'personne' }}</p>
+                            </div>
+                        </div>
+                        <a href="{{ route('rooms.show', array_filter(['id' => $room['id'], 'check_in' => $search['check_in'], 'check_out' => $search['check_out'], 'guests' => $search['guests'], 'rooms_quantity' => $search['rooms_quantity'] > 1 ? $search['rooms_quantity'] : null])) }}" class="btn-secondary mt-4 w-full sm:w-auto"><x-icon name="pencil" class="h-4 w-4" /> Modifier les dates ou les personnes</a>
+                    @if ($quoteError)
+                        <p class="mt-3 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{{ $quoteError }}</p>
+                    @endif
+                    @else
                     <form method="GET" action="{{ route('bookings.new') }}" class="mt-4 grid gap-3 sm:grid-cols-4 sm:items-end">
                         @if ($room)<input type="hidden" name="room_id" value="{{ $room['id'] }}">@else<input type="hidden" name="accommodation_id" value="{{ $acc['id'] }}">@endif
                         <x-input name="check_in" type="date" label="Arrivée" :value="$search['check_in']" :min="now()->toDateString()" required />
@@ -30,6 +44,7 @@
                     @if ($quoteError)
                         <p class="mt-3 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{{ $quoteError }}</p>
                     @endif
+                    @endif
                 </section>
 
                 <form method="POST" action="{{ route('bookings.store') }}" class="space-y-6" x-data="{ third: {{ old('booked_for_third_party') ? 'true' : 'false' }} }">
@@ -39,6 +54,7 @@
                     <input type="hidden" name="check_in" value="{{ $search['check_in'] }}">
                     <input type="hidden" name="check_out" value="{{ $search['check_out'] }}">
                     <input type="hidden" name="guests" value="{{ $search['guests'] }}">
+                    <input type="hidden" name="rooms_quantity" value="{{ $search['rooms_quantity'] }}">
                     @error('check_in')<p class="field-error">{{ $message }}</p>@enderror
 
                     <section class="card space-y-4">
