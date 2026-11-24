@@ -16,7 +16,7 @@ use Illuminate\Support\Facades\Log;
  */
 class AlertService
 {
-    public const TEMPLATE = 'bosejour_alerte_supervision';
+    public const TEMPLATE = 'yfl_alerte_supervision';
 
     private const LEVELS = ['critical' => 'CRITIQUE', 'major' => 'IMPORTANT', 'minor' => 'INFO'];
 

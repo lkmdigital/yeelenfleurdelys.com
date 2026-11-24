@@ -1,7 +1,7 @@
 /*
  * Parcours navigateur de la supervision : socle commun (lancement du navigateur, garde-fous, capture
  * d'écran en cas d'échec, rapport JSON). Lancé par `php artisan ops:browser-journeys <profil>` ; Playwright
- * est résolu via NODE_PATH (installation hors dépôt : ~/.yfl-monitor ou /var/www/monbeaupays-monitor).
+ * est résolu via NODE_PATH (installation hors dépôt : ~/.yfl-monitor ou /var/www/yfl-monitor).
  */
 const fs = require('fs');
 const path = require('path');

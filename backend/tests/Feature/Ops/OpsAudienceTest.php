@@ -45,7 +45,7 @@ class OpsAudienceTest extends TestCase
 
     public function test_a_page_view_is_recorded_with_device_browser_system_and_language(): void
     {
-        $this->track('/accommodations/12?utm=x', self::PHONE, 'https://www.google.com/search?q=bosejour', ['Accept-Language' => 'fr-FR,fr;q=0.9'])->assertNoContent();
+        $this->track('/accommodations/12?utm=x', self::PHONE, 'https://www.google.com/search?q=yeelen', ['Accept-Language' => 'fr-FR,fr;q=0.9'])->assertNoContent();
 
         $row = DB::table('ops_visits')->first();
         $this->assertSame('/accommodations/12', $row->path, 'les paramètres de l\'adresse ne sont pas conservés');

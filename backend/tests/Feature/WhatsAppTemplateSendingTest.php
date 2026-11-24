@@ -37,7 +37,7 @@ class WhatsAppTemplateSendingTest extends TestCase
             $t = $request['template'];
             return $request['to'] === '2250703244464'
                 && $request['type'] === 'template'
-                && $t['name'] === 'bosejour_demande_acceptee'
+                && $t['name'] === 'yfl_demande_acceptee'
                 && $t['language']['code'] === 'fr'
                 // Retour à la ligne aplati : Meta rejette les \n dans une variable.
                 && $t['components'][0]['parameters'][0]['text'] === 'Résidence Le Balafon'
@@ -67,7 +67,7 @@ class WhatsAppTemplateSendingTest extends TestCase
 
         Http::assertSent(function ($r) {
             $c = $r['template']['components'];
-            return $r['template']['name'] === 'bosejour_code_verification'
+            return $r['template']['name'] === 'yfl_code_verification'
                 && $c[0]['parameters'][0]['text'] === '123456'
                 && $c[1]['parameters'][0]['text'] === '123456';
         });

@@ -16,14 +16,14 @@ class WhatsAppService
 {
     /**
      * Noms des modèles approuvés côté Meta (WhatsApp Manager), langue « fr ». Le détail
-     * des textes et de l'ordre des variables est dans modeles-whatsapp-bosejour.md ; toute
+     * des textes et de l'ordre des variables est dans la section WhatsApp de DEPLOIEMENT-HOSTINGER.md ; toute
      * modification d'un modèle chez Meta doit être répercutée ici (ordre des variables).
      */
-    public const TPL_REQUEST_RECEIVED = 'bosejour_demande_recue';
-    public const TPL_NEW_REQUEST = 'bosejour_nouvelle_demande';
-    public const TPL_APPROVED_PLEASE_PAY = 'bosejour_demande_acceptee';
-    public const TPL_CONFIRMATION = 'bosejour_reservation_confirmee_v2';
-    public const TPL_VERIFICATION_CODE = 'bosejour_code_verification';
+    public const TPL_REQUEST_RECEIVED = 'yfl_demande_recue';
+    public const TPL_NEW_REQUEST = 'yfl_nouvelle_demande';
+    public const TPL_APPROVED_PLEASE_PAY = 'yfl_demande_acceptee';
+    public const TPL_CONFIRMATION = 'yfl_reservation_confirmee';
+    public const TPL_VERIFICATION_CODE = 'yfl_code_verification';
     public const TEMPLATE_LANGUAGE = 'fr';
     /** Indicatif ajouté aux numéros saisis sans indicatif (Côte d'Ivoire). */
     public const DEFAULT_COUNTRY_CODE = '225';

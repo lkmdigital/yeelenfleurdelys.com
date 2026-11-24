@@ -19,7 +19,7 @@ use Illuminate\Support\Str;
 class MegaBoReport
 {
     /** Modèle WhatsApp : {{1}} = date, {{2}} = résumé court. À faire approuver par Meta (catégorie Utilitaire). */
-    public const TEMPLATE = 'bosejour_rapport_megabo';
+    public const TEMPLATE = 'yfl_rapport_megabo';
 
     public function __construct(private MegaBoService $bo, private MegaBoData $data, private AlertService $alerts) {}
 

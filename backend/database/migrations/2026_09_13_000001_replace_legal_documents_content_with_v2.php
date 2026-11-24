@@ -8,7 +8,7 @@ use Illuminate\Database\Migrations\Migration;
  * "Envoyer CGU" / "Format des conditions d'utilisation défini") : remplace le
  * contenu v1.0 (rédigé le 2026-08-27 à partir des fonctionnalités réelles,
  * jamais relu par un juriste) par le document contractuel officiel fourni par
- * le client — "BoSejour_Document_Contractuel_Global_CGU_CGV_PC_V2_0.docx" —
+ * le client (document contractuel global CGU / CGV / PC, version 2.0) —
  * découpé en ses 3 parties pour correspondre aux 3 slugs existants (cgu/cgv/
  * confidentialite), déjà publiés.
  *

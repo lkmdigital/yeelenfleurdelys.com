@@ -78,6 +78,22 @@ paiement sur place / garantie et confirmation par e-mail.
 
 Après toute modification du `.env` : `php artisan config:cache`.
 
+### Modèles WhatsApp à créer chez Meta
+
+Les messages WhatsApp automatiques passent par des **modèles** à créer dans le WhatsApp Manager
+du client (catégorie « Utilitaire », langue « fr »), **exactement sous ces noms** et avec les
+variables dans cet ordre. Tant qu'un modèle n'est pas approuvé, le site se rabat sur l'e-mail.
+
+| Modèle | Variables, dans l'ordre |
+|---|---|
+| `yfl_reservation_confirmee` | {{1}} établissement · {{2}} n° de réservation · {{3}} arrivée · {{4}} départ |
+| `yfl_nouvelle_demande` (au gérant) | {{1}} établissement · {{2}} arrivée · {{3}} départ · {{4}} délai de réponse |
+| `yfl_demande_recue` (au client) | aucune |
+| `yfl_demande_acceptee` | {{1}} établissement · {{2}} arrivée · {{3}} départ · bouton « Payer » vers `https://yeelenfleurdelys.com/paiement/{{1}}` |
+| `yfl_code_verification` | {{1}} code (modèle « Authentification » avec bouton « Copier le code ») |
+| `yfl_alerte_supervision` (équipe) | {{1}} niveau · {{2}} titre · {{3}} détail |
+| `yfl_rapport_megabo` (équipe) | {{1}} date · {{2}} résumé |
+
 ## 4. Tâches planifiées (hPanel → Avancé → Tâches Cron, toutes les minutes)
 
 ```

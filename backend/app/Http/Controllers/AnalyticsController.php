@@ -455,7 +455,7 @@ class AnalyticsController extends Controller
             $q->where('host_id', $hostId);
         })->where('status', 'cancelled'))->count();
         $cancellationRateHost = $totalBookings > 0 ? ($cancelledBookingsHost / $totalBookings) * 100 : 0;
-        $scoreBosejour = round(
+        $scorePlateforme = round(
             (($averageRatingHost / 5) * 100 * 0.4) +
             ($occupancyRate * 0.3) +
             ((100 - $cancellationRateHost) * 0.3),
@@ -489,7 +489,7 @@ class AnalyticsController extends Controller
             'available_rooms_now' => $availableRoomsNow,
             'revenue_by_room_type' => $revenueByRoomType,
             'occupancy_by_week' => $occupancyByWeek,
-            'score_bosejour' => $scoreBosejour,
+            'score_plateforme' => $scorePlateforme,
             'conversion_rate' => $conversionRateHost,
             'top_accommodations' => $topAccommodations,
             'accommodations_stats' => $accommodationsStats,

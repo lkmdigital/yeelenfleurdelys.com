@@ -80,7 +80,7 @@ class BackupDatabaseTest extends TestCase
     public function test_old_backups_beyond_the_retention_are_purged(): void
     {
         File::ensureDirectoryExists($this->backupDir);
-        $old = $this->backupDir . '/monbeaupays_old.sql.gz';
+        $old = $this->backupDir . '/yfl_old.sql.gz';
         File::put($old, 'x');
         touch($old, now()->subDays(30)->getTimestamp());
 

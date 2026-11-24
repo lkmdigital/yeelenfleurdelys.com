@@ -8,7 +8,7 @@ use Laravel\Sanctum\Sanctum;
 use Tests\TestCase;
 
 /**
- * Retour client 2026-09-15 : "assure toi que l'administrateur bosejour depuis
+ * Retour client 2026-09-15 : "assure toi que l'administrateur depuis
  * son dashboard peut consulter l'état de chaque hote et vérifier ses
  * documents" — la liste agrégée de /dashboard/admin/conformite existait déjà
  * (AdminComplianceController) mais sa fiche détail par hôte

@@ -100,7 +100,7 @@ class OpsChecksTest extends TestCase
 
         $this->fakeHttp([
             'api.test/api/settings/public' => Http::response(['whatsapp_verification_enabled' => true]),
-            'graph.facebook.com/*' => Http::response(['data' => [['name' => 'bosejour_code_verification', 'status' => 'APPROVED']]]),
+            'graph.facebook.com/*' => Http::response(['data' => [['name' => 'yfl_code_verification', 'status' => 'APPROVED']]]),
         ]);
         $this->assertSame('ok', $this->runCheck('business.verification_flag')->status);
 

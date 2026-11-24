@@ -180,7 +180,7 @@ class CheckRegistry
             return CheckResult::ok('Vérification du numéro par WhatsApp désactivée : réservation libre');
         }
 
-        $approved = $this->whatsappTemplateStatus('bosejour_code_verification');
+        $approved = $this->whatsappTemplateStatus('yfl_code_verification');
         if ($approved === 'APPROVED') {
             return CheckResult::ok('Vérification du numéro active, modèle d\'authentification approuvé');
         }

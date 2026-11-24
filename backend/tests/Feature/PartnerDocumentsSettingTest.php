@@ -12,7 +12,7 @@ use Laravel\Sanctum\Sanctum;
 use Tests\TestCase;
 
 /**
- * Décision bosejour du 2026-11-05 : les documents de conformité des partenaires deviennent FACULTATIFS pour le moment
+ * Décision du 2026-11-05 : les documents de conformité des partenaires deviennent FACULTATIFS pour le moment
  * (ils bloquaient beaucoup de partenaires) ; le super administrateur peut les rendre obligatoires « au moment venu ».
  */
 class PartnerDocumentsSettingTest extends TestCase

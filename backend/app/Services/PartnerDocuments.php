@@ -10,7 +10,7 @@ use Illuminate\Support\Facades\Log;
  * Les documents de conformité des partenaires (pièce d'identité, justificatif de domicile, licence, RCCM, document fiscal
  * et leurs numéros) sont-ils OBLIGATOIRES pour ajouter un établissement ?
  *
- * Décision bosejour du 2026-11-05 : FACULTATIFS pour le moment — ils bloquaient beaucoup de partenaires. Le super
+ * Décision du 2026-11-05 : FACULTATIFS pour le moment — ils bloquaient beaucoup de partenaires. Le super
  * administrateur peut les rendre obligatoires « au moment venu » (Paramètres > Documents partenaires). Tant qu'ils sont
  * facultatifs : plus de profil à 100 % documents compris, plus de validation du compte par un administrateur avant
  * d'ajouter un établissement, plus de relances de conformité. Les informations de contact restent demandées.

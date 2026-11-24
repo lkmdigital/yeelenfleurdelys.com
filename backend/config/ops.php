@@ -31,7 +31,7 @@ return [
 
     // Parcours navigateur : Node.js et dossier où Playwright est installé (hors dépôt).
     'node_binary' => env('OPS_NODE_BINARY', 'node'),
-    'playwright_path' => env('OPS_PLAYWRIGHT_PATH', '/var/www/monbeaupays-monitor/node_modules'),
+    'playwright_path' => env('OPS_PLAYWRIGHT_PATH', '/var/www/yfl-monitor/node_modules'),
 
     // Seuils.
     'ssl_warn_days' => 14,
